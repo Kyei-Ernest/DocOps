@@ -2,15 +2,20 @@ package models
 
 
 type DecryptParams struct {
-	Nonce      []byte      `json:"nonce"`
-	Ciphertext []byte      `json:"ciphertext"`
-	AAD        []byte      `json:"aad"`
+	Nonce           []byte      `json:"nonce"`
+	Ciphertext      []byte      `json:"ciphertext"`
+	AAD             []byte      `json:"aad"`
+    HashedPassword  []byte      `json:"hashed_password"`
+
 	
 }
 
 
 type EncryptParams struct {
-	Plaintext string `json:"plaintext"`
+	Plaintext       string   `json:"plaintext"`
+    Password        string   `json:"password"`
+    StoredPHCHash   []byte   `json:"stored_phc_hash"`
+    Salt            []byte   `json:"salt"`
 }
 
 type Argon2idParams struct {
@@ -22,10 +27,11 @@ type Argon2idParams struct {
 }
 
 // Recommended params (adjust based on your server's capacity)
-var DefaultParams = &Argon2idParams{
+var DefaultArgonParams = &Argon2idParams{
     Memory:      64 * 1024, // 64 MB
     Iterations:  3,
     Parallelism: 2,
     SaltLength:  16,
     KeyLength:   32,
 }
+
