@@ -1,119 +1,172 @@
 package crypto
 
 import (
-	"testing"
-	"github.com/Kyei-Ernest/DocOps/models"
+    "bytes"
+    "testing"
+
+    "github.com/Kyei-Ernest/DocOps/models"
 )
 
+// ─── HELPERS ─────────────────────────────────────────────────
 
-// ─── SALT ────────────────────────────────────────────────────
-func TestGenerateSalt(t *testing.T) {
-    salt1, err := GenerateSalt()
+// mustGenerateSalt calls GenerateSalt and fails the test immediately on error.
+func mustGenerateSalt(t *testing.T) []byte {
+    t.Helper()
+    salt, err := GenerateSalt()
     if err != nil {
         t.Fatalf("GenerateSalt failed: %v", err)
     }
-    if len(salt1) != 16 {
-        t.Fatalf("expected 16 bytes, got %d", len(salt1))
-    }
+    return salt
+}
 
-    // two salts should never be the same
-    salt2, _ := GenerateSalt()
-    if string(salt1) == string(salt2) {
+// mustGenerateDEK calls GenerateDEK and fails the test immediately on error.
+func mustGenerateDEK(t *testing.T) []byte {
+    t.Helper()
+    dek, err := GenerateDEK()
+    if err != nil {
+        t.Fatalf("GenerateDEK failed: %v", err)
+    }
+    return dek
+}
+
+// mustEncrypt calls Encrypt and fails the test immediately on error.
+func mustEncrypt(t *testing.T, plaintext, key []byte) (ciphertext, nonce []byte) {
+    t.Helper()
+    ct, n, err := Encrypt(plaintext, key)
+    if err != nil {
+        t.Fatalf("Encrypt failed: %v", err)
+    }
+    return ct, n
+}
+
+// ─── SALT ────────────────────────────────────────────────────
+
+func TestGenerateSalt_Length(t *testing.T) {
+    salt := mustGenerateSalt(t)
+    if len(salt) != 16 {
+        t.Fatalf("expected 16 bytes, got %d", len(salt))
+    }
+}
+
+func TestGenerateSalt_Uniqueness(t *testing.T) {
+    salt1 := mustGenerateSalt(t)
+    salt2 := mustGenerateSalt(t)
+    if bytes.Equal(salt1, salt2) {
         t.Fatal("two salts are identical — randomness broken")
     }
 }
 
 // ─── DEK ─────────────────────────────────────────────────────
-func TestGenerateDEK(t *testing.T) {
-    dek1, err := GenerateDEK()
-    if err != nil {
-        t.Fatalf("GenerateDEK failed: %v", err)
-    }
-    if len(dek1) != 32 {
-        t.Fatalf("expected 32 bytes, got %d", len(dek1))
-    }
 
-    dek2, _ := GenerateDEK()
-    if string(dek1) == string(dek2) {
+func TestGenerateDEK_Length(t *testing.T) {
+    dek := mustGenerateDEK(t)
+    if len(dek) != 32 {
+        t.Fatalf("expected 32 bytes, got %d", len(dek))
+    }
+}
+
+func TestGenerateDEK_Uniqueness(t *testing.T) {
+    dek1 := mustGenerateDEK(t)
+    dek2 := mustGenerateDEK(t)
+    if bytes.Equal(dek1, dek2) {
         t.Fatal("two DEKs are identical — randomness broken")
     }
 }
 
 // ─── KEK DERIVATION ──────────────────────────────────────────
+
+func TestDeriveKEK_Length(t *testing.T) {
+    salt := mustGenerateSalt(t)
+    kek := DeriveKEK("password", salt, models.DefaultArgonParams)
+    if len(kek) != 32 {
+        t.Fatalf("expected 32-byte KEK, got %d", len(kek))
+    }
+}
+
 func TestDeriveKEK_IsDeterministic(t *testing.T) {
-    password := "mypassword"
-    salt, _ := GenerateSalt()
-
-    kek1 := DeriveKEK(password, salt, models.DefaultArgonParams)
-    kek2 := DeriveKEK(password, salt, models.DefaultArgonParams)
-
-    // same inputs must always produce same KEK
-    if string(kek1) != string(kek2) {
+    salt := mustGenerateSalt(t)
+    kek1 := DeriveKEK("mypassword", salt, models.DefaultArgonParams)
+    kek2 := DeriveKEK("mypassword", salt, models.DefaultArgonParams)
+    if !bytes.Equal(kek1, kek2) {
         t.Fatal("DeriveKEK is not deterministic — same inputs gave different outputs")
     }
 }
 
 func TestDeriveKEK_DifferentPasswords(t *testing.T) {
-    salt, _ := GenerateSalt()
-
+    salt := mustGenerateSalt(t)
     kek1 := DeriveKEK("password1", salt, models.DefaultArgonParams)
     kek2 := DeriveKEK("password2", salt, models.DefaultArgonParams)
-
-    if string(kek1) == string(kek2) {
+    if bytes.Equal(kek1, kek2) {
         t.Fatal("different passwords produced the same KEK")
     }
 }
 
 func TestDeriveKEK_DifferentSalts(t *testing.T) {
-    salt1, _ := GenerateSalt()
-    salt2, _ := GenerateSalt()
-
+    salt1 := mustGenerateSalt(t)
+    salt2 := mustGenerateSalt(t)
     kek1 := DeriveKEK("samepassword", salt1, models.DefaultArgonParams)
     kek2 := DeriveKEK("samepassword", salt2, models.DefaultArgonParams)
-
-    if string(kek1) == string(kek2) {
+    if bytes.Equal(kek1, kek2) {
         t.Fatal("different salts produced the same KEK")
     }
 }
 
 // ─── ENCRYPT / DECRYPT ───────────────────────────────────────
+
 func TestEncryptDecrypt_RoundTrip(t *testing.T) {
-    key, _ := GenerateDEK()
+    key := mustGenerateDEK(t)
     plaintext := []byte("this is my secret document")
 
-    ciphertext, nonce, err := Encrypt(plaintext, key)
-    if err != nil {
-        t.Fatalf("Encrypt failed: %v", err)
-    }
+    ciphertext, nonce := mustEncrypt(t, plaintext, key)
 
     result, err := Decrypt(ciphertext, nonce, key)
     if err != nil {
         t.Fatalf("Decrypt failed: %v", err)
     }
-
-    if string(result) != string(plaintext) {
+    if !bytes.Equal(result, plaintext) {
         t.Fatalf("expected %q got %q", plaintext, result)
     }
 }
 
+// TestEncryptDecrypt_EmptyPlaintext ensures empty input is handled correctly
+// rather than panicking or producing a zero-length ciphertext.
+func TestEncryptDecrypt_EmptyPlaintext(t *testing.T) {
+    key := mustGenerateDEK(t)
+    plaintext := []byte{}
+
+    ciphertext, nonce := mustEncrypt(t, plaintext, key)
+
+    result, err := Decrypt(ciphertext, nonce, key)
+    if err != nil {
+        t.Fatalf("Decrypt of empty plaintext failed: %v", err)
+    }
+    if !bytes.Equal(result, plaintext) {
+        t.Fatalf("round-trip of empty plaintext failed: got %q", result)
+    }
+}
+
 func TestEncrypt_ProducesDifferentCiphertextEachTime(t *testing.T) {
-    key, _ := GenerateDEK()
+    key := mustGenerateDEK(t)
     plaintext := []byte("same plaintext")
 
-    cipher1, _, _ := Encrypt(plaintext, key)
-    cipher2, _, _ := Encrypt(plaintext, key)
+    cipher1, nonce1 := mustEncrypt(t, plaintext, key)
+    cipher2, nonce2 := mustEncrypt(t, plaintext, key)
 
-    // nonces differ so ciphertext must differ
-    if string(cipher1) == string(cipher2) {
+    // nonces must differ (randomness check)
+    if bytes.Equal(nonce1, nonce2) {
+        t.Fatal("two encryptions produced the same nonce — nonce reuse detected")
+    }
+    // ciphertexts must therefore also differ
+    if bytes.Equal(cipher1, cipher2) {
         t.Fatal("same plaintext produced identical ciphertext — nonce reuse detected")
     }
 }
 
 func TestDecrypt_WrongKeyFails(t *testing.T) {
-    key, _ := GenerateDEK()
-    wrongKey, _ := GenerateDEK()
+    key := mustGenerateDEK(t)
+    wrongKey := mustGenerateDEK(t)
 
-    ciphertext, nonce, _ := Encrypt([]byte("secret"), key)
+    ciphertext, nonce := mustEncrypt(t, []byte("secret"), key)
 
     _, err := Decrypt(ciphertext, nonce, wrongKey)
     if err == nil {
@@ -122,11 +175,10 @@ func TestDecrypt_WrongKeyFails(t *testing.T) {
 }
 
 func TestDecrypt_TamperedCiphertextFails(t *testing.T) {
-    key, _ := GenerateDEK()
-    ciphertext, nonce, _ := Encrypt([]byte("secret"), key)
+    key := mustGenerateDEK(t)
+    ciphertext, nonce := mustEncrypt(t, []byte("secret"), key)
 
-    // flip a byte
-    ciphertext[0] ^= 0xFF
+    ciphertext[0] ^= 0xFF // flip one bit
 
     _, err := Decrypt(ciphertext, nonce, key)
     if err == nil {
@@ -134,9 +186,53 @@ func TestDecrypt_TamperedCiphertextFails(t *testing.T) {
     }
 }
 
+// TestDecrypt_TruncatedNonceFails confirms that a malformed (too-short) nonce
+// is rejected rather than silently reading out of bounds.
+func TestDecrypt_TruncatedNonceFails(t *testing.T) {
+    key := mustGenerateDEK(t)
+    ciphertext, nonce := mustEncrypt(t, []byte("secret"), key)
+
+    truncated := nonce[:len(nonce)/2]
+
+    _, err := Decrypt(ciphertext, truncated, key)
+    if err == nil {
+        t.Fatal("decryption with truncated nonce should have failed")
+    }
+}
+
 // ─── VERIFICATION BLOB ───────────────────────────────────────
+
 func TestVerifyKEK_CorrectKey(t *testing.T) {
-    salt, _ := GenerateSalt()
+    salt := mustGenerateSalt(t)
+    kek := DeriveKEK("mypassword", salt, models.DefaultArgonParams)
+
+    blob, nonce, err := CreateVerificationBlob(kek)
+    if err != nil {
+        t.Fatalf("CreateVerificationBlob failed: %v", err)
+    }
+    if !VerifyKEK(kek, blob, nonce) {
+        t.Fatal("VerifyKEK returned false for correct key")
+    }
+}
+
+func TestVerifyKEK_WrongKey(t *testing.T) {
+    salt := mustGenerateSalt(t)
+    kek := DeriveKEK("correctpassword", salt, models.DefaultArgonParams)
+    wrongKEK := DeriveKEK("wrongpassword", salt, models.DefaultArgonParams)
+
+    blob, nonce, err := CreateVerificationBlob(kek)
+    if err != nil {
+        t.Fatalf("CreateVerificationBlob failed: %v", err)
+    }
+    if VerifyKEK(wrongKEK, blob, nonce) {
+        t.Fatal("VerifyKEK returned true for wrong key")
+    }
+}
+
+// TestVerifyKEK_TamperedBlob confirms that a single flipped bit in the
+// verification blob is caught by the AEAD authentication tag.
+func TestVerifyKEK_TamperedBlob(t *testing.T) {
+    salt := mustGenerateSalt(t)
     kek := DeriveKEK("mypassword", salt, models.DefaultArgonParams)
 
     blob, nonce, err := CreateVerificationBlob(kek)
@@ -144,40 +240,51 @@ func TestVerifyKEK_CorrectKey(t *testing.T) {
         t.Fatalf("CreateVerificationBlob failed: %v", err)
     }
 
-    if !VerifyKEK(kek, blob, nonce) {
-        t.Fatal("VerifyKEK returned false for correct key")
+    blob[0] ^= 0xFF // corrupt one byte
+
+    if VerifyKEK(kek, blob, nonce) {
+        t.Fatal("VerifyKEK returned true for tampered blob — authentication not enforced")
     }
 }
 
-func TestVerifyKEK_WrongKey(t *testing.T) {
-    salt, _ := GenerateSalt()
-    kek := DeriveKEK("correctpassword", salt, models.DefaultArgonParams)
-    wrongKEK := DeriveKEK("wrongpassword", salt, models.DefaultArgonParams)
+// TestCreateVerificationBlob_NonceUniqueness ensures each call generates a
+// fresh nonce. Reusing nonces with the same key breaks AES-GCM security.
+func TestCreateVerificationBlob_NonceUniqueness(t *testing.T) {
+    salt := mustGenerateSalt(t)
+    kek := DeriveKEK("mypassword", salt, models.DefaultArgonParams)
 
-    blob, nonce, _ := CreateVerificationBlob(kek)
-
-    if VerifyKEK(wrongKEK, blob, nonce) {
-        t.Fatal("VerifyKEK returned true for wrong key")
+    _, nonce1, err := CreateVerificationBlob(kek)
+    if err != nil {
+        t.Fatalf("first CreateVerificationBlob failed: %v", err)
+    }
+    _, nonce2, err := CreateVerificationBlob(kek)
+    if err != nil {
+        t.Fatalf("second CreateVerificationBlob failed: %v", err)
+    }
+    if bytes.Equal(nonce1, nonce2) {
+        t.Fatal("CreateVerificationBlob reused a nonce — AES-GCM security broken")
     }
 }
 
 // ─── FULL FLOW ───────────────────────────────────────────────
+
 func TestFullEncryptionFlow(t *testing.T) {
     password := "mypassword"
 
     // ── REGISTRATION ──
-    salt, _ := GenerateSalt()
+    salt := mustGenerateSalt(t)
     kek := DeriveKEK(password, salt, models.DefaultArgonParams)
-    blob, blobNonce, _ := CreateVerificationBlob(kek)
-    // store in DB: salt, blob, blobNonce
+    blob, blobNonce, err := CreateVerificationBlob(kek)
+    if err != nil {
+        t.Fatalf("CreateVerificationBlob failed: %v", err)
+    }
 
     // ── FILE UPLOAD ──
-    dek, _ := GenerateDEK()
+    dek := mustGenerateDEK(t)
     fileContent := []byte("this is my contract pdf content")
 
-    encryptedFile, fileNonce, _ := Encrypt(fileContent, dek)
-    encryptedDEK, dekNonce, _ := Encrypt(dek, kek)
-    // store in DB: encryptedFile (at provider), encryptedDEK, fileNonce, dekNonce
+    encryptedFile, fileNonce := mustEncrypt(t, fileContent, dek)
+    encryptedDEK, dekNonce := mustEncrypt(t, dek, kek)
 
     // ── NEW SESSION / LOGIN ──
     recoveredKEK := DeriveKEK(password, salt, models.DefaultArgonParams)
@@ -196,9 +303,7 @@ func TestFullEncryptionFlow(t *testing.T) {
         t.Fatalf("failed to decrypt file: %v", err)
     }
 
-    if string(recoveredFile) != string(fileContent) {
+    if !bytes.Equal(recoveredFile, fileContent) {
         t.Fatalf("file content mismatch: expected %q got %q", fileContent, recoveredFile)
     }
-
-    t.Log("full encryption flow passed ✅")
 }
