@@ -355,7 +355,7 @@ func (h *AuthHandler) signJWT(sessionToken string) (string, error) {
 		},
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	return token.SignedString(h.jwtSecret)
+	return token.SignedString(h.jwtSecret)  // ← JWT generated here
 }
 
 // parseJWT validates a JWT string and returns its claims.

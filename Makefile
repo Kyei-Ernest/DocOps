@@ -3,17 +3,24 @@
 run:
 	go run -tags "fts5" main.go
 
-store_test:
+services_metadata_test:
 	go test -tags "fts5" -v ./services/metadata/
 
-crypto_test:
+services_crypto_test:
 	go test -v ./services/crypto/
 
-auth_user_test:
+services_auth_user_test:package middleware
+
 	go test -v ./services/auth/
 
-session_test:
+services_auth_session_test:
 	go test -v ./services/auth/
+
+auth_handler_test:
+	go test -v ./handlers/
+
+auth_middleware_test:
+	go test -v ./middleware/
 
 build:
 	go build -tags "fts5" -o docops .
