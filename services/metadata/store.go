@@ -26,7 +26,6 @@ func New(dbPath string) (*Store, error) {
 	if err := migrate(db); err != nil {
 		return nil, fmt.Errorf("migration failed: %w", err)
 	}
-
 	return &Store{db: db}, nil
 }
 

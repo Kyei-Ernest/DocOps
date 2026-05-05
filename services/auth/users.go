@@ -3,8 +3,11 @@ package auth
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"time"
 
+	"github.com/mattn/go-sqlite3"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -45,7 +48,7 @@ func (s *UserStore) migrate() error {
 			id                  TEXT PRIMARY KEY,
 			email               TEXT UNIQUE NOT NULL,
 			password_hash       TEXT NOT NULL,
-			salt                BLOB NOT NULL,
+		  	salt                BLOB NOT NULL,
 			verification_blob   BLOB NOT NULL,
 			verification_nonce  BLOB NOT NULL,
 			created_at          DATETIME NOT NULL
@@ -54,15 +57,28 @@ func (s *UserStore) migrate() error {
 	return err
 }
 
+var ErrDuplicateEmail = errors.New("email already registered")
+
+
 // CreateUser inserts a new user record into the database.
 // Returns an error if the email is already taken (UNIQUE constraint) or if
 // the insert fails for any other reason.
 func (s *UserStore) CreateUser(ctx context.Context, u *User) error {
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO users (id, email, password_hash, salt, verification_blob, verification_nonce, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, u.ID, u.Email, u.PasswordHash, u.Salt, u.VerificationBlob, u.VerificationNonce, u.CreatedAt)
-	return err
+
+    _, err := s.db.ExecContext(ctx, `
+        INSERT INTO users (id, email, password_hash, salt, verification_blob, verification_nonce, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    `, u.ID, u.Email, u.PasswordHash, u.Salt, u.VerificationBlob, u.VerificationNonce, u.CreatedAt)
+
+    if err != nil {
+        var sqliteErr sqlite3.Error
+        if errors.As(err, &sqliteErr) && sqliteErr.ExtendedCode == sqlite3.ErrConstraintUnique {
+            return fmt.Errorf("createUser: %w", ErrDuplicateEmail)
+        }
+        return fmt.Errorf("createUser: %w", err)
+    }
+
+    return nil
 }
 
 // GetByEmail looks up a user by their email address.
@@ -88,3 +104,4 @@ func (s *UserStore) GetByEmail(ctx context.Context, email string) (*User, error)
 	}
 	return u, err
 }
+

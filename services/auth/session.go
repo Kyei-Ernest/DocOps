@@ -50,7 +50,7 @@ func (s *SessionStore) Save(token string, session *Session) {
 // ones, intentionally giving callers no way to distinguish the two cases —
 // this avoids leaking whether a token ever existed.
 //
-// Note: the expired entry is not removed here to keep the read path lock-free
+// Note: the expired entry is not removed here to keep the read path from needing a write lock
 // at the cost of leaving stale entries in the map until Delete is called or
 // the process restarts.
 func (s *SessionStore) Get(token string) (*Session, bool) {
