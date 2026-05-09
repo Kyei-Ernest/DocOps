@@ -10,23 +10,23 @@ DocOps is a self-hostable Go API that handles encrypted file upload, download, a
 
 ```
 ┌─────────────────────────────────────────────────┐
-│                   Handlers                       │
-│          (HTTP glue — no business logic)          │
-│   auth.go ── register, login, refresh, logout    │
+│                   Handlers                      │
+│          (HTTP glue — no business logic)        │
+│   auth.go ── register, login, refresh, logout   │
 ├─────────────────────────────────────────────────┤
-│                   Services                       │
+│                   Services                      │
 │  ┌──────────┐  ┌──────────┐  ┌───────────────┐  │
-│  │  crypto   │  │   auth   │  │   metadata    │  │
+│  │  crypto  │  │   auth   │  │   metadata    │  │
 │  │          │  │          │  │               │  │
 │  │ Argon2id │  │ UserStore│  │ SQLite + FTS5 │  │
 │  │ AES-GCM  │  │ Sessions │  │ Document CRUD │  │
 │  └──────────┘  └──────────┘  └───────────────┘  │
 ├─────────────────────────────────────────────────┤
-│                    Models                        │
-│       Document  ·  Argon2idParams  ·  User       │
+│                    Models                       │
+│       Document  ·  Argon2idParams  ·  User      │
 ├─────────────────────────────────────────────────┤
-│              Connectors (planned)                │
-│           S3  ·  GCS  ·  Google Drive            │
+│              Connectors (planned)               │
+│           S3  ·  GCS  ·  Google Drive           │
 └─────────────────────────────────────────────────┘
 ```
 
