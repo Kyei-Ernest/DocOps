@@ -9,10 +9,11 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/Kyei-Ernest/DocOps/services/crypto"
 	"github.com/Kyei-Ernest/DocOps/models"
+	"github.com/Kyei-Ernest/DocOps/services/crypto"
 	authsvc "github.com/Kyei-Ernest/DocOps/services/auth"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 )
 
 // accessTokenDuration controls how long an access JWT remains valid.
@@ -44,7 +45,7 @@ type Claims struct {
 type AuthHandler struct {
 	users     *authsvc.UserStore
 	sessions  *authsvc.SessionStore
-	params    *models.Argon2idParams // shared Argon2id cost parameters (time, memory, threads)
+	params    *models.Argon2Config // shared Argon2id cost parameters (time, memory, threads)
 	jwtSecret []byte                 // HMAC-SHA256 signing key for JWTs; must stay secret
 }
 
@@ -54,7 +55,7 @@ type AuthHandler struct {
 func NewAuthHandler(
 	users *authsvc.UserStore,
 	sessions *authsvc.SessionStore,
-	params *models.Argon2idParams,
+	params *models.Argon2Config,
 	jwtSecret []byte,
 ) *AuthHandler {
 	return &AuthHandler{
@@ -138,11 +139,13 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 	}
 
 	user := &authsvc.User{
+		ID:                uuid.NewString(),
 		Email:             req.Email,
 		PasswordHash:      passwordHash,
 		Salt:              kekSalt,
 		VerificationBlob:  blob,
 		VerificationNonce: nonce,
+		CreatedAt:         time.Now(),
 	}
 	if err := h.users.CreateUser(r.Context(), user); err != nil {
 		// Surface a conflict specifically so the caller can show a helpful message.

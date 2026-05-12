@@ -3,14 +3,15 @@ package main
 import "fmt"
 
 func main() {
-    ages := make(map[string]int)
+    type contextKey struct{ name string }
 
-    // populate
-    ages["Ernest"] = 21
-    ages["Ama"] = 19
-    ages["Kojo"] = 25
+    var (
+	// KEKKey is the context key under which the session KEK ([]byte) is stored.
+	KEKKey = &contextKey{"kek"}
 
-    a, b := ages["Ernest"]
+	// UserIDKey is the context key under which the authenticated user ID (string) is stored.
+	UserIDKey = &contextKey{"userID"}
+)
 
-	fmt.Println(a, b)
+fmt.Println(KEKKey.name, UserIDKey.name)
 }

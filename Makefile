@@ -22,5 +22,8 @@ auth_handler_test:
 auth_middleware_test:
 	go test -v ./middleware/
 
+local_connector_test:
+	go test -v ./connectors/local/
+
 build:
 	go build -tags "fts5" -o docops .

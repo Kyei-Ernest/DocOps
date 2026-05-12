@@ -43,6 +43,7 @@ func migrate(db *sql.DB) error {
 	_, err := db.Exec(`
         CREATE TABLE IF NOT EXISTS documents (
             id             TEXT PRIMARY KEY,
+            user_id        TEXT NOT NULL,   -- owner; every query must filter on this
             name           TEXT NOT NULL,
             file_type      TEXT,
             provider       TEXT NOT NULL,   -- storage backend (e.g. "s3", "gcs")
@@ -112,12 +113,13 @@ func migrate(db *sql.DB) error {
 func (s *Store) Save(ctx context.Context, doc *models.Document) error {
 	_, err := s.db.ExecContext(ctx, `
         INSERT INTO documents (
-            id, name, file_type, provider, storage_key,
+            id, user_id, name, file_type, provider, storage_key,
             encrypted, size_bytes, tags, extracted_text,
             encrypted_dek, dek_nonce, file_nonce,
             created_at, expires_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		doc.ID,
+		doc.UserID,
 		doc.Name,
 		doc.FileType,
 		doc.Provider,
@@ -138,21 +140,23 @@ func (s *Store) Save(ctx context.Context, doc *models.Document) error {
 	return nil
 }
 
-// GetByID fetches a single document by its primary key.
+// GetByID fetches a single document by its primary key, scoped to the given user.
 // Returns a "document not found" error (not sql.ErrNoRows) when no row matches,
 // making callers independent of the database/sql package internals.
-func (s *Store) GetByID(ctx context.Context, id string) (*models.Document, error) {
+// The userID filter ensures a user can never access another user's document.
+func (s *Store) GetByID(ctx context.Context, id, userID string) (*models.Document, error) {
 	row := s.db.QueryRowContext(ctx, `
         SELECT
-            id, name, file_type, provider, storage_key,
+            id, user_id, name, file_type, provider, storage_key,
             encrypted, size_bytes, tags, extracted_text,
             encrypted_dek, dek_nonce, file_nonce,
             created_at, expires_at
-        FROM documents WHERE id = ?`, id)
+        FROM documents WHERE id = ? AND user_id = ?`, id, userID)
 
 	doc := &models.Document{}
 	err := row.Scan(
 		&doc.ID,
+		&doc.UserID,
 		&doc.Name,
 		&doc.FileType,
 		&doc.Provider,
@@ -178,18 +182,19 @@ func (s *Store) GetByID(ctx context.Context, id string) (*models.Document, error
 
 // Search performs a full-text search against the FTS5 index using the provided
 // query string (supports FTS5 match syntax, e.g. "invoice AND 2024").
-// Results are joined back to the documents table and ordered by relevance rank.
+// Results are joined back to the documents table, filtered by userID, and
+// ordered by relevance rank.
 // Note: sensitive columns (extracted_text, encryption blobs) are intentionally
 // omitted from search results to minimise exposure.
-func (s *Store) Search(ctx context.Context, query string) ([]*models.Document, error) {
+func (s *Store) Search(ctx context.Context, userID, query string) ([]*models.Document, error) {
 	rows, err := s.db.QueryContext(ctx, `
         SELECT
-            d.id, d.name, d.file_type, d.provider, d.storage_key,
+            d.id, d.user_id, d.name, d.file_type, d.provider, d.storage_key,
             d.encrypted, d.size_bytes, d.tags, d.created_at, d.expires_at
         FROM documents d
         JOIN documents_fts fts ON d.id = fts.id
-        WHERE documents_fts MATCH ?
-        ORDER BY rank`, query)
+        WHERE documents_fts MATCH ? AND d.user_id = ?
+        ORDER BY rank`, query, userID)
 	if err != nil {
 		return nil, fmt.Errorf("search failed: %w", err)
 	}
@@ -200,6 +205,7 @@ func (s *Store) Search(ctx context.Context, query string) ([]*models.Document, e
 		doc := &models.Document{}
 		err := rows.Scan(
 			&doc.ID,
+			&doc.UserID,
 			&doc.Name,
 			&doc.FileType,
 			&doc.Provider,
@@ -218,19 +224,20 @@ func (s *Store) Search(ctx context.Context, query string) ([]*models.Document, e
 	return results, nil
 }
 
-// Delete removes the document with the given ID from the database.
-// The AFTER DELETE trigger (documents_ad) automatically purges the
-// corresponding FTS index entry.
-// Returns a "document not found" error when no row was affected.
-func (s *Store) Delete(ctx context.Context, id string) error {
+// Delete removes the document with the given ID from the database, scoped to
+// the given user. The AFTER DELETE trigger (documents_ad) automatically purges
+// the corresponding FTS index entry.
+// Returns a "document not found" error when no row was affected — this covers
+// both genuinely missing documents and attempts to delete another user's document.
+func (s *Store) Delete(ctx context.Context, id, userID string) error {
 	result, err := s.db.ExecContext(ctx,
-		"DELETE FROM documents WHERE id = ?", id)
+		"DELETE FROM documents WHERE id = ? AND user_id = ?", id, userID)
 	if err != nil {
 		return fmt.Errorf("failed to delete document: %w", err)
 	}
 
-	// RowsAffected == 0 means the ID didn't exist; surface this as an error
-	// so callers can distinguish a successful delete from a no-op.
+	// RowsAffected == 0 means the ID didn't exist or belongs to another user;
+	// surface this as an error so callers can return 404.
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
 		return fmt.Errorf("document not found: %s", id)

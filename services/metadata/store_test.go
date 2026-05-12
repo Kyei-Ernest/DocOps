@@ -8,6 +8,12 @@ import (
     "github.com/Kyei-Ernest/DocOps/models"
 )
 
+// testUserID is a fixed user ID used across all tests in this file.
+const testUserID = "user_test_owner"
+
+// otherUserID is a second user ID used to test cross-user isolation.
+const otherUserID = "user_test_other"
+
 // newTestStore creates an isolated in-memory SQLite store for each test.
 // The store is NOT registered for t.Cleanup — callers must defer store.Close()
 // so failures in Close() are surfaced explicitly.
@@ -29,6 +35,7 @@ func testDoc() *models.Document {
 
     return &models.Document{
         ID:            "doc_test001",
+        UserID:        testUserID,
         Name:          "contract.pdf",
         FileType:      "application/pdf",
         Provider:      "local",
@@ -65,7 +72,7 @@ func TestSaveAndGetByID_FullRoundTrip(t *testing.T) {
     doc := testDoc()
     mustSave(t, store, doc)
 
-    fetched, err := store.GetByID(context.Background(), doc.ID)
+    fetched, err := store.GetByID(context.Background(), doc.ID, testUserID)
     if err != nil {
         t.Fatalf("GetByID failed: %v", err)
     }
@@ -73,6 +80,9 @@ func TestSaveAndGetByID_FullRoundTrip(t *testing.T) {
     // scalar fields
     if fetched.ID != doc.ID {
         t.Errorf("ID: want %q got %q", doc.ID, fetched.ID)
+    }
+    if fetched.UserID != doc.UserID {
+        t.Errorf("UserID: want %q got %q", doc.UserID, fetched.UserID)
     }
     if fetched.Name != doc.Name {
         t.Errorf("Name: want %q got %q", doc.Name, fetched.Name)
@@ -133,7 +143,7 @@ func TestSaveAndGetByID_NullExpiry(t *testing.T) {
     doc.ExpiresAt = nil
     mustSave(t, store, doc)
 
-    fetched, err := store.GetByID(context.Background(), doc.ID)
+    fetched, err := store.GetByID(context.Background(), doc.ID, testUserID)
     if err != nil {
         t.Fatalf("GetByID failed: %v", err)
     }
@@ -146,9 +156,24 @@ func TestGetByID_NotFound(t *testing.T) {
     store := newTestStore(t)
     defer store.Close()
 
-    _, err := store.GetByID(context.Background(), "nonexistent")
+    _, err := store.GetByID(context.Background(), "nonexistent", testUserID)
     if err == nil {
         t.Fatal("expected error for missing document, got nil")
+    }
+}
+
+// TestGetByID_WrongUser ensures a document owned by one user is invisible
+// to another user — the query must return "not found", not the document.
+func TestGetByID_WrongUser(t *testing.T) {
+    store := newTestStore(t)
+    defer store.Close()
+
+    doc := testDoc()
+    mustSave(t, store, doc)
+
+    _, err := store.GetByID(context.Background(), doc.ID, otherUserID)
+    if err == nil {
+        t.Fatal("expected error when accessing another user's document, got nil")
     }
 }
 
@@ -177,7 +202,7 @@ func TestSearch_FindsByExtractedText(t *testing.T) {
 
     mustSave(t, store, testDoc())
 
-    results, err := store.Search(context.Background(), "agreement")
+    results, err := store.Search(context.Background(), testUserID, "agreement")
     if err != nil {
         t.Fatalf("Search failed: %v", err)
     }
@@ -195,7 +220,7 @@ func TestSearch_FindsByTag(t *testing.T) {
 
     mustSave(t, store, testDoc())
 
-    results, err := store.Search(context.Background(), "legal")
+    results, err := store.Search(context.Background(), testUserID, "legal")
     if err != nil {
         t.Fatalf("Search failed: %v", err)
     }
@@ -219,7 +244,7 @@ func TestSearch_OnlyMatchingDocumentReturned(t *testing.T) {
     other.ExtractedText = "quarterly earnings report"
     mustSave(t, store, other)
 
-    results, err := store.Search(context.Background(), "earnings")
+    results, err := store.Search(context.Background(), testUserID, "earnings")
     if err != nil {
         t.Fatalf("Search failed: %v", err)
     }
@@ -231,13 +256,30 @@ func TestSearch_OnlyMatchingDocumentReturned(t *testing.T) {
     }
 }
 
+// TestSearch_CrossUserIsolation inserts a document under one user and confirms
+// that searching as a different user returns no results.
+func TestSearch_CrossUserIsolation(t *testing.T) {
+    store := newTestStore(t)
+    defer store.Close()
+
+    mustSave(t, store, testDoc())
+
+    results, err := store.Search(context.Background(), otherUserID, "agreement")
+    if err != nil {
+        t.Fatalf("Search failed: %v", err)
+    }
+    if len(results) != 0 {
+        t.Fatalf("expected 0 results for wrong user, got %d", len(results))
+    }
+}
+
 func TestSearch_NoResults(t *testing.T) {
     store := newTestStore(t)
     defer store.Close()
 
     mustSave(t, store, testDoc())
 
-    results, err := store.Search(context.Background(), "xyznotfound")
+    results, err := store.Search(context.Background(), testUserID, "xyznotfound")
     if err != nil {
         t.Fatalf("Search failed: %v", err)
     }
@@ -252,7 +294,7 @@ func TestSearch_EmptyStore(t *testing.T) {
     store := newTestStore(t)
     defer store.Close()
 
-    results, err := store.Search(context.Background(), "anything")
+    results, err := store.Search(context.Background(), testUserID, "anything")
     if err != nil {
         t.Fatalf("Search on empty store failed: %v", err)
     }
@@ -272,13 +314,33 @@ func TestDelete_RemovesDocument(t *testing.T) {
     doc := testDoc()
     mustSave(t, store, doc)
 
-    if err := store.Delete(context.Background(), doc.ID); err != nil {
+    if err := store.Delete(context.Background(), doc.ID, testUserID); err != nil {
         t.Fatalf("Delete failed: %v", err)
     }
 
-    _, err := store.GetByID(context.Background(), doc.ID)
+    _, err := store.GetByID(context.Background(), doc.ID, testUserID)
     if err == nil {
         t.Fatal("document still present after Delete")
+    }
+}
+
+// TestDelete_WrongUser ensures a user cannot delete another user's document.
+func TestDelete_WrongUser(t *testing.T) {
+    store := newTestStore(t)
+    defer store.Close()
+
+    doc := testDoc()
+    mustSave(t, store, doc)
+
+    err := store.Delete(context.Background(), doc.ID, otherUserID)
+    if err == nil {
+        t.Fatal("expected error when deleting another user's document, got nil")
+    }
+
+    // Confirm the document is still there for the real owner
+    _, err = store.GetByID(context.Background(), doc.ID, testUserID)
+    if err != nil {
+        t.Fatalf("document was deleted by wrong user: %v", err)
     }
 }
 
@@ -291,11 +353,11 @@ func TestDelete_PurgesFTSIndex(t *testing.T) {
     doc := testDoc()
     mustSave(t, store, doc)
 
-    if err := store.Delete(context.Background(), doc.ID); err != nil {
+    if err := store.Delete(context.Background(), doc.ID, testUserID); err != nil {
         t.Fatalf("Delete failed: %v", err)
     }
 
-    results, err := store.Search(context.Background(), "agreement")
+    results, err := store.Search(context.Background(), testUserID, "agreement")
     if err != nil {
         t.Fatalf("Search after delete failed: %v", err)
     }
@@ -308,7 +370,7 @@ func TestDelete_NotFound(t *testing.T) {
     store := newTestStore(t)
     defer store.Close()
 
-    err := store.Delete(context.Background(), "nonexistent")
+    err := store.Delete(context.Background(), "nonexistent", testUserID)
     if err == nil {
         t.Fatal("expected error when deleting nonexistent document, got nil")
     }

@@ -1,0 +1,22 @@
+server:
+  port: 8080
+  read_timeout:  "30s"
+  write_timeout: "30s"
+
+storage:
+  local:
+    path: "./docops-data/files"
+
+auth:
+  access_token_ttl:  "15m"
+  refresh_token_ttl: "168h"
+
+database:
+  path: "./docops-data/docops.db"
+
+argon2:
+  memory:      65536
+  iterations:  3
+  parallelism: 2
+  key_length:  32
+  salt_length: 16

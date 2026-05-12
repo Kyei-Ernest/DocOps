@@ -18,7 +18,7 @@ import (
 
 // testParams uses intentionally cheap Argon2id settings so tests run fast.
 // Never use these values in production — they provide no real security.
-var testParams = &models.Argon2idParams{
+var testParams = &models.Argon2Config{
 	Memory:      64 * 1024,
 	Iterations:  1,
 	Parallelism: 1,

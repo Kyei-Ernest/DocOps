@@ -7,6 +7,16 @@ import (
     "github.com/Kyei-Ernest/DocOps/models"
 )
 
+
+// Recommended params (adjust based on your server's capacity)
+var DefaultArgonParams = &models.Argon2Config{
+    Memory:      64 * 1024, // 64 MB
+    Iterations:  3,
+    Parallelism: 2,
+    SaltLength:  16,
+    KeyLength:   32,
+}
+
 // ─── HELPERS ─────────────────────────────────────────────────
 
 // mustGenerateSalt calls GenerateSalt and fails the test immediately on error.
@@ -77,7 +87,7 @@ func TestGenerateDEK_Uniqueness(t *testing.T) {
 
 func TestDeriveKEK_Length(t *testing.T) {
     salt := mustGenerateSalt(t)
-    kek := DeriveKEK("password", salt, models.DefaultArgonParams)
+    kek := DeriveKEK("password", salt, DefaultArgonParams)
     if len(kek) != 32 {
         t.Fatalf("expected 32-byte KEK, got %d", len(kek))
     }
@@ -85,8 +95,8 @@ func TestDeriveKEK_Length(t *testing.T) {
 
 func TestDeriveKEK_IsDeterministic(t *testing.T) {
     salt := mustGenerateSalt(t)
-    kek1 := DeriveKEK("mypassword", salt, models.DefaultArgonParams)
-    kek2 := DeriveKEK("mypassword", salt, models.DefaultArgonParams)
+    kek1 := DeriveKEK("mypassword", salt, DefaultArgonParams)
+    kek2 := DeriveKEK("mypassword", salt, DefaultArgonParams)
     if !bytes.Equal(kek1, kek2) {
         t.Fatal("DeriveKEK is not deterministic — same inputs gave different outputs")
     }
@@ -94,8 +104,8 @@ func TestDeriveKEK_IsDeterministic(t *testing.T) {
 
 func TestDeriveKEK_DifferentPasswords(t *testing.T) {
     salt := mustGenerateSalt(t)
-    kek1 := DeriveKEK("password1", salt, models.DefaultArgonParams)
-    kek2 := DeriveKEK("password2", salt, models.DefaultArgonParams)
+    kek1 := DeriveKEK("password1", salt, DefaultArgonParams)
+    kek2 := DeriveKEK("password2", salt, DefaultArgonParams)
     if bytes.Equal(kek1, kek2) {
         t.Fatal("different passwords produced the same KEK")
     }
@@ -104,8 +114,8 @@ func TestDeriveKEK_DifferentPasswords(t *testing.T) {
 func TestDeriveKEK_DifferentSalts(t *testing.T) {
     salt1 := mustGenerateSalt(t)
     salt2 := mustGenerateSalt(t)
-    kek1 := DeriveKEK("samepassword", salt1, models.DefaultArgonParams)
-    kek2 := DeriveKEK("samepassword", salt2, models.DefaultArgonParams)
+    kek1 := DeriveKEK("samepassword", salt1, DefaultArgonParams)
+    kek2 := DeriveKEK("samepassword", salt2, DefaultArgonParams)
     if bytes.Equal(kek1, kek2) {
         t.Fatal("different salts produced the same KEK")
     }
@@ -204,7 +214,7 @@ func TestDecrypt_TruncatedNonceFails(t *testing.T) {
 
 func TestVerifyKEK_CorrectKey(t *testing.T) {
     salt := mustGenerateSalt(t)
-    kek := DeriveKEK("mypassword", salt, models.DefaultArgonParams)
+    kek := DeriveKEK("mypassword", salt, DefaultArgonParams)
 
     blob, nonce, err := CreateVerificationBlob(kek)
     if err != nil {
@@ -217,8 +227,8 @@ func TestVerifyKEK_CorrectKey(t *testing.T) {
 
 func TestVerifyKEK_WrongKey(t *testing.T) {
     salt := mustGenerateSalt(t)
-    kek := DeriveKEK("correctpassword", salt, models.DefaultArgonParams)
-    wrongKEK := DeriveKEK("wrongpassword", salt, models.DefaultArgonParams)
+    kek := DeriveKEK("correctpassword", salt, DefaultArgonParams)
+    wrongKEK := DeriveKEK("wrongpassword", salt, DefaultArgonParams)
 
     blob, nonce, err := CreateVerificationBlob(kek)
     if err != nil {
@@ -233,7 +243,7 @@ func TestVerifyKEK_WrongKey(t *testing.T) {
 // verification blob is caught by the AEAD authentication tag.
 func TestVerifyKEK_TamperedBlob(t *testing.T) {
     salt := mustGenerateSalt(t)
-    kek := DeriveKEK("mypassword", salt, models.DefaultArgonParams)
+    kek := DeriveKEK("mypassword", salt, DefaultArgonParams)
 
     blob, nonce, err := CreateVerificationBlob(kek)
     if err != nil {
@@ -251,7 +261,7 @@ func TestVerifyKEK_TamperedBlob(t *testing.T) {
 // fresh nonce. Reusing nonces with the same key breaks AES-GCM security.
 func TestCreateVerificationBlob_NonceUniqueness(t *testing.T) {
     salt := mustGenerateSalt(t)
-    kek := DeriveKEK("mypassword", salt, models.DefaultArgonParams)
+    kek := DeriveKEK("mypassword", salt, DefaultArgonParams)
 
     _, nonce1, err := CreateVerificationBlob(kek)
     if err != nil {
@@ -273,7 +283,7 @@ func TestFullEncryptionFlow(t *testing.T) {
 
     // ── REGISTRATION ──
     salt := mustGenerateSalt(t)
-    kek := DeriveKEK(password, salt, models.DefaultArgonParams)
+    kek := DeriveKEK(password, salt, DefaultArgonParams)
     blob, blobNonce, err := CreateVerificationBlob(kek)
     if err != nil {
         t.Fatalf("CreateVerificationBlob failed: %v", err)
@@ -287,7 +297,7 @@ func TestFullEncryptionFlow(t *testing.T) {
     encryptedDEK, dekNonce := mustEncrypt(t, dek, kek)
 
     // ── NEW SESSION / LOGIN ──
-    recoveredKEK := DeriveKEK(password, salt, models.DefaultArgonParams)
+    recoveredKEK := DeriveKEK(password, salt, DefaultArgonParams)
     if !VerifyKEK(recoveredKEK, blob, blobNonce) {
         t.Fatal("login verification failed")
     }

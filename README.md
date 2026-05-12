@@ -1,104 +1,339 @@
-# DocOps
+<p align="center">
+  <h1 align="center">🔐 DocOps</h1>
+  <p align="center">
+    <strong>Self-hostable encrypted document storage API</strong>
+  </p>
+  <p align="center">
+    Encrypt, upload, and search documents through a single API — backed by your own storage provider.
+  </p>
+  <p align="center">
+    <a href="#quickstart"><strong>Quickstart</strong></a> ·
+    <a href="#features"><strong>Features</strong></a> ·
+    <a href="#api-reference"><strong>API</strong></a> ·
+    <a href="#configuration"><strong>Config</strong></a> ·
+    <a href="#contributing"><strong>Contributing</strong></a>
+  </p>
+</p>
 
-DocOps is a self-hostable Go API that handles encrypted file upload, download, and search — routing to your own cloud storage provider.
+<br/>
 
-- **DocOps does not store your files** — they go to your provider (S3, Google Drive, etc.)
-- **DocOps does not manage users or teams** — it is a developer API, not an end-user product
-- **DocOps does not replace your storage provider** — you still need S3, GCS, or similar
+<p align="center">
+  <img alt="Go Version" src="https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat-square&logo=go&logoColor=white" />
+  <img alt="License" src="https://img.shields.io/badge/License-MIT-blue?style=flat-square" />
+  <img alt="Tests" src="https://img.shields.io/badge/Tests-73_passing-brightgreen?style=flat-square" />
+  <img alt="Status" src="https://img.shields.io/badge/Status-Alpha-orange?style=flat-square" />
+</p>
+
+---
+
+## Why DocOps?
+
+Most document storage solutions force you to trust a third party with your plaintext files. DocOps takes a different approach: **your files are encrypted before they ever leave the server**, using keys derived from your password that are never persisted to disk.
+
+- **Zero-knowledge encryption** — files are encrypted with per-document keys; the server never stores your master key
+- **Bring your own storage** — local disk today, S3/GCS/Google Drive on the roadmap
+- **Full-text search** — search across document names, tags, and extracted text via SQLite FTS5
+- **Multi-tenant by default** — every query is scoped by user; document isolation is enforced at the database layer
+
+> [!NOTE]
+> DocOps is in **active development (alpha)**. The core encryption, auth, and storage layers are built and tested. Cloud connectors and download endpoints are coming next.
+
+---
+
+## Features
+
+| Feature | Status | Description |
+|---------|--------|-------------|
+| 🔑 Envelope encryption | ✅ | Per-document AES-256-GCM keys, wrapped by a user-derived KEK |
+| 🔒 Argon2id auth | ✅ | Password hashing + KEK derivation with independent salts |
+| 🍪 JWT sessions | ✅ | HttpOnly/Secure cookies with access (15m) + refresh (7d) tokens |
+| 🔍 Full-text search | ✅ | SQLite FTS5 with trigger-synced index |
+| 📤 File upload | ✅ | Multipart upload with streaming encryption |
+| 💾 Local storage | ✅ | Filesystem connector with streaming I/O |
+| ⚙️ YAML config | ✅ | Sensible defaults, `.env` for secrets |
+| 🛡️ Auth middleware | ✅ | JWT → session → KEK resolution per request |
+| 👥 Multi-tenant | ✅ | All operations scoped by `user_id` |
+| 📥 File download | 🚧 | DEK decryption + streaming response |
+| ☁️ Cloud connectors | 🚧 | S3, GCS, Google Drive |
+| 📝 Text extraction | 🚧 | PDF/DOCX content extraction for search |
+
+---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│                   Handlers                      │
-│          (HTTP glue — no business logic)        │
-│   auth.go ── register, login, refresh, logout   │
-├─────────────────────────────────────────────────┤
-│                   Services                      │
-│  ┌──────────┐  ┌──────────┐  ┌───────────────┐  │
-│  │  crypto  │  │   auth   │  │   metadata    │  │
-│  │          │  │          │  │               │  │
-│  │ Argon2id │  │ UserStore│  │ SQLite + FTS5 │  │
-│  │ AES-GCM  │  │ Sessions │  │ Document CRUD │  │
-│  └──────────┘  └──────────┘  └───────────────┘  │
-├─────────────────────────────────────────────────┤
-│                    Models                       │
-│       Document  ·  Argon2idParams  ·  User      │
-├─────────────────────────────────────────────────┤
-│              Connectors (planned)               │
-│           S3  ·  GCS  ·  Google Drive           │
-└─────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│  Handlers                                               │
+│  auth.go ─── register · login · refresh · logout        │
+│  upload.go ── encrypted file upload (POST /v1/docs)     │
+├───────────────────────────┬─────────────────────────────┤
+│  Middleware               │  Config                     │
+│  JWT validation           │  YAML + .env loader         │
+│  Session → KEK injection  │  Typed ParsedConfig output  │
+├───────────────────────────┴─────────────────────────────┤
+│  Services                                               │
+│  ┌──────────┐  ┌───────────┐  ┌───────────────────┐     │
+│  │  crypto   │  │   auth    │  │     metadata      │    │
+│  │ Argon2id  │  │ UserStore │  │ SQLite + FTS5     │    │
+│  │ AES-GCM   │  │ Sessions  │  │ User-scoped CRUD  │    │
+│  └──────────┘  └───────────┘  └───────────────────┘     │
+├─────────────────────────────────────────────────────────┤
+│  Connectors                                             │
+│  ┌───────────────┐  ┌───────────────────────────────┐   │
+│  │ local (disk)   │  │ s3 · gcs · gdrive (planned)  │   │
+│  └───────────────┘  └───────────────────────────────┘   │
+└─────────────────────────────────────────────────────────┘
 ```
 
-## Encryption Model
+---
 
-DocOps uses a **two-layer envelope encryption** scheme:
+## Security Model
 
-1. **KEK (Key Encryption Key)** — derived from the user's password via Argon2id with a unique salt. Held only in memory for the session lifetime; never persisted.
-2. **DEK (Data Encryption Key)** — a random 256-bit AES key generated per document. Encrypted under the KEK and stored alongside document metadata.
-3. **Files** are encrypted with AES-256-GCM using the DEK before being sent to the storage provider.
+DocOps uses **two-layer envelope encryption** so that compromising any single component does not expose plaintext documents:
 
-The JWT carries only an opaque session token — the KEK never leaves the server's memory.
+```
+Password ──▶ Argon2id ──▶ KEK (in-memory only, never persisted)
+                            │
+                            ▼
+                     ┌──────────────┐
+                     │ Encrypt DEK  │ ◀── random 256-bit DEK per document
+                     └──────┬───────┘
+                            │
+                            ▼
+                   Encrypted DEK stored in SQLite
+                   Encrypted file stored in connector
+```
 
-## What's Built
+| Property | Guarantee |
+|----------|-----------|
+| KEK storage | Never written to disk — lives in server memory for session duration only |
+| DEK uniqueness | Fresh 256-bit random key per document |
+| Nonce reuse | Each encryption call generates a fresh random nonce |
+| Password hash vs KEK | Independent Argon2id derivations with separate salts |
+| JWT contents | Opaque session token only — no key material in the token |
+| Session revocation | Server-side session store; logout invalidates immediately |
+| Timing attacks | Constant-time comparison for password verification |
 
-### `services/crypto`
-- Argon2id password hashing (PHC format)
-- Password verification with constant-time comparison
-- KEK derivation (independent salt from password hash)
-- AES-256-GCM encrypt / decrypt
-- DEK generation
-- Verification blob (sentinel-based KEK correctness check)
+---
 
-### `services/auth`
-- `UserStore` — SQLite-backed user persistence with schema migration
-- `SessionStore` — in-memory, goroutine-safe session store with lazy expiry
+## Quickstart
 
-### `services/metadata`
-- `Store` — SQLite-backed document CRUD with FTS5 full-text search
-- Trigger-synced FTS index (auto insert/delete)
-- Search by document name, tags, or extracted text
+### Prerequisites
 
-### `handlers`
-- `AuthHandler` — register, login, token refresh, logout
-- JWT (HMAC-SHA256) with HttpOnly/Secure/SameSite cookies
-- Access token (15 min) + refresh token (7 days)
+- **Go 1.25+**
+- **CGO enabled** (required by `go-sqlite3`)
+- **SQLite with FTS5** support (included in most distributions)
 
-### Test Coverage
-- **51 tests** across all packages
-- Covers: round-trips, edge cases, security properties (user enumeration, nonce reuse, tamper detection, algorithm confusion)
-
-## What's Next
-
-- [ ] Nonce length validation in `Decrypt` (currently panics on malformed input)
-- [ ] Set `User.ID` and `CreatedAt` in `Register` handler
-- [ ] Auth middleware (JWT → session → KEK resolution)
-- [ ] API route definitions and HTTP mux wiring
-- [ ] Storage connectors (S3, GCS, Google Drive)
-- [ ] File upload/download handlers with envelope encryption
-- [ ] Configuration loading from `config.yaml`
-
-## Getting Started
+### Install & Run
 
 ```bash
+# Clone
+git clone https://github.com/Kyei-Ernest/DocOps.git
+cd DocOps
+
+# Set your JWT secret
+echo 'JWT_SECRET=change-me-to-a-real-secret' > .env
+
 # Build
 make build
 
 # Run
 make run
-
-# Run all tests
-go test -tags "fts5" -v ./...
-
-# Individual test targets
-make crypto_test
-make store_test
-make auth_user_test
-make session_test
 ```
 
-## Requirements
+The server starts on `http://localhost:8080` by default. No config file is required — sensible defaults are applied automatically.
 
-- Go 1.25+
-- CGO enabled (required for `go-sqlite3`)
-- SQLite with FTS5 support
+### Run Tests
+
+```bash
+# All tests
+go test -tags "fts5" -v ./...
+
+# By package
+make services_crypto_test       # 19 tests — encryption, hashing, KEK derivation
+make services_metadata_test     # 15 tests — document CRUD, FTS5 search, isolation
+make auth_handler_test          # 14 tests — register, login, refresh, logout
+make services_auth_user_test    #  2 tests — user persistence
+make services_auth_session_test #  8 tests — session lifecycle, expiry
+make auth_middleware_test        #  8 tests — JWT validation, context injection
+make local_connector_test        #  7 tests — filesystem upload, download, delete
+```
+
+---
+
+## API Reference
+
+### Authentication
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/v1/auth/register` | Create account — returns access + refresh cookies |
+| `POST` | `/v1/auth/login` | Authenticate — returns access + refresh cookies |
+| `POST` | `/v1/auth/refresh` | Exchange refresh cookie for new access cookie |
+| `POST` | `/v1/auth/logout` | Revoke sessions and clear cookies |
+
+### Documents
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/v1/docs/upload` | Upload encrypted document (multipart/form-data) |
+
+#### Upload Request
+
+```bash
+curl -X POST http://localhost:8080/v1/docs/upload \
+  -b cookies.txt \
+  -F "file=@document.pdf" \
+  -F "tags=legal,2026"
+```
+
+#### Upload Response
+
+```json
+{
+  "id": "doc_a1b2c3d4-...",
+  "name": "document.pdf",
+  "file_type": "application/pdf",
+  "size_bytes": 104857,
+  "encrypted": true,
+  "tags": "legal,2026",
+  "created_at": "2026-05-12T14:00:00Z"
+}
+```
+
+> [!IMPORTANT]
+> All document endpoints require authentication. The auth middleware injects the KEK and user ID from the server-side session — no key material is ever sent by the client.
+
+---
+
+## Configuration
+
+DocOps loads configuration in order of precedence:
+
+1. **`config.yaml`** — optional; defaults applied if absent
+2. **Environment variables** — secrets only (never committed to YAML)
+3. **`.env` file** — convenience for local development
+
+### `config.yaml`
+
+```yaml
+server:
+  port: 8080
+  read_timeout:  "30s"
+  write_timeout: "30s"
+
+storage:
+  local:
+    path: "./docops-data/files"
+
+auth:
+  access_token_ttl:  "15m"    # short-lived access tokens
+  refresh_token_ttl: "168h"   # 7-day refresh tokens
+
+database:
+  path: "./docops-data/docops.db"
+
+argon2:
+  memory:      65536   # 64 MiB
+  iterations:  3
+  parallelism: 2
+  key_length:  32      # 256-bit keys
+  salt_length: 16      # 128-bit salts
+```
+
+### Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `JWT_SECRET` | **Yes** | HMAC-SHA256 signing key for JWTs. Use ≥ 32 random bytes. |
+
+---
+
+## Project Structure
+
+```
+DocOps/
+├── main.go                     # Entry point
+├── config.yaml                 # Runtime configuration
+├── Makefile                    # Build & test targets
+│
+├── config/
+│   └── config.go               # YAML + env loader, defaults, path resolution
+│
+├── models/
+│   ├── config.go               # Config, ServerConfig, AuthConfig, Argon2Config
+│   ├── document.go             # Document model (with encryption metadata)
+│   ├── crypto.go               # EncryptParams, DecryptParams
+│   └── storage.go              # UploadRequest, FileRef
+│
+├── services/
+│   ├── crypto/
+│   │   ├── crypto.go           # Argon2id, AES-256-GCM, KEK/DEK operations
+│   │   └── crypto_test.go      # 19 tests
+│   ├── auth/
+│   │   ├── users.go            # SQLite-backed UserStore
+│   │   ├── users_test.go       #  2 tests
+│   │   ├── session.go          # In-memory SessionStore with lazy expiry
+│   │   └── session_test.go     #  8 tests
+│   └── metadata/
+│       ├── store.go            # Document CRUD + FTS5 search (user-scoped)
+│       └── store_test.go       # 15 tests
+│
+├── middleware/
+│   ├── auth.go                 # JWT → session → context middleware
+│   └── auth_test.go            #  8 tests
+│
+├── handlers/
+│   ├── auth.go                 # Register, login, refresh, logout
+│   ├── auth_test.go            # 14 tests
+│   └── upload.go               # Encrypted file upload handler
+│
+└── connectors/
+    ├── connector.go            # StorageConnector interface
+    └── local/
+        ├── local.go            # Filesystem-backed connector
+        └── local_test.go       #  7 tests
+```
+
+---
+
+## Roadmap
+
+- [ ] HTTP mux wiring and route registration
+- [ ] File download handler with DEK decryption
+- [ ] Cloud storage connectors (S3, GCS, Google Drive)
+- [ ] Text extraction (PDF, DOCX) for search indexing
+- [ ] Document expiry and TTL enforcement
+- [ ] Rate limiting middleware
+- [ ] Structured logging (slog)
+- [ ] Docker image and Compose file
+- [ ] OpenAPI specification
+
+---
+
+## Contributing
+
+Contributions are welcome! Here's how to get started:
+
+1. **Fork** the repository
+2. **Create a branch** for your feature (`git checkout -b feat/my-feature`)
+3. **Write tests** — the project maintains high test coverage by design
+4. **Run the full suite** before submitting: `go test -tags "fts5" -v ./...`
+5. **Open a Pull Request** with a clear description of your changes
+
+### Development Notes
+
+- CGO is required for SQLite — set `CGO_ENABLED=1`
+- Use the `-tags "fts5"` build tag for all commands that touch the metadata store
+- Secrets must come from the environment, never from config files
+- All new database operations must include `user_id` scoping
+
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
+
+---
+
+

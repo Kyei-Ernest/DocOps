@@ -23,7 +23,7 @@ import (
 // twice will produce different output — this is expected and correct.
 // The PHC format is self-describing, meaning VerifyPassword can reconstruct all
 // parameters it needs directly from the encoded string without any extra state.
-func HashPassword(password string, p *models.Argon2idParams) (string, error) {
+func HashPassword(password string, p *models.Argon2Config) (string, error) {
 	salt := make([]byte, p.SaltLength)
 	if _, err := rand.Read(salt); err != nil {
 		return "", err
@@ -89,7 +89,7 @@ func VerifyPassword(password, encoded string) (*models.EncryptParams, error) {
 
 	// Reconstruct the cost parameters that were used when the hash was created.
 	// These must be used as-is; changing them would produce a different hash.
-	var p models.Argon2idParams
+	var p models.Argon2Config
 	if _, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d",
 		&p.Memory, &p.Iterations, &p.Parallelism); err != nil {
 		return nil, ErrInvalidHash
@@ -148,7 +148,7 @@ func ParsePHCString(phcString string) ([]byte, error) {
 // The same password + salt + params triple always yields the same KEK, so it
 // can be re-derived at login without storing the KEK anywhere. The salt must
 // be the one stored alongside the user's password hash in the database.
-func DeriveKEK(password string, salt []byte, p *models.Argon2idParams) []byte {
+func DeriveKEK(password string, salt []byte, p *models.Argon2Config) []byte {
 	return argon2.IDKey(
 		[]byte(password),
 		salt,
@@ -222,6 +222,9 @@ func Decrypt(blob, nonce, kek []byte) ([]byte, error) {
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
 		return nil, err
+	}
+	if len(nonce) != gcm.NonceSize() {
+		return nil, fmt.Errorf("invalid nonce length: got %d, want %d", len(nonce), gcm.NonceSize())
 	}
 	decrypted, err := gcm.Open(nil, nonce, blob, nil)
 	if err != nil {
