@@ -1,29 +1,41 @@
-.PHONY: run store_test crypto_test build
+.PHONY: build run test \
+       services_crypto_test services_metadata_test \
+       services_auth_user_test services_auth_session_test \
+       auth_handler_test auth_middleware_test \
+       local_connector_test
+
+# ── Build & Run ───────────────────────────────────────────────
+
+build:
+	go build -tags "fts5" -o docops .
 
 run:
 	go run -tags "fts5" main.go
 
-services_metadata_test:
-	go test -tags "fts5" -v ./services/metadata/
+# ── Test All ──────────────────────────────────────────────────
+
+test:
+	go test -tags "fts5" -v ./...
+
+# ── Test by Package ───────────────────────────────────────────
 
 services_crypto_test:
 	go test -v ./services/crypto/
 
-services_auth_user_test:package middleware
+services_metadata_test:
+	go test -tags "fts5" -v ./services/metadata/
 
-	go test -v ./services/auth/
+services_auth_user_test:
+	go test -v ./services/auth/ -run TestUser
 
 services_auth_session_test:
-	go test -v ./services/auth/
+	go test -v ./services/auth/ -run TestSession
 
 auth_handler_test:
-	go test -v ./handlers/
+	go test -tags "fts5" -v ./handlers/
 
 auth_middleware_test:
 	go test -v ./middleware/
 
 local_connector_test:
 	go test -v ./connectors/local/
-
-build:
-	go build -tags "fts5" -o docops .
