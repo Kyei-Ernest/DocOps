@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"encoding/binary"
 
 	"github.com/Kyei-Ernest/DocOps/models"
 
@@ -210,6 +211,18 @@ func VerifyKEK(kek, blob, nonce []byte) bool {
 	return string(plaintext) == "docops-verify-v1"
 }
 
+
+// WrapDEK encrypts a plaintext DEK under the user's KEK for safe storage.
+func WrapDEK(dek, kek []byte) (wrappedDEK, nonce []byte, err error) {
+    return Encrypt(dek, kek)
+}
+
+// UnwrapDEK decrypts a stored wrapped DEK using the user's KEK,
+// returning the plaintext DEK ready for document encryption/decryption.
+func UnwrapDEK(wrappedDEK, nonce, kek []byte) ([]byte, error) {
+    return Decrypt(wrappedDEK, nonce, kek)
+}
+
 // Decrypt decrypts blob using AES-256-GCM with the provided nonce and kek.
 // The GCM authentication tag (appended to the ciphertext by Encrypt) is
 // verified automatically — if the blob or nonce has been tampered with,
@@ -262,4 +275,148 @@ func Encrypt(plaintext, key []byte) (ciphertext, nonce []byte, err error) {
 
 	ciphertext = gcm.Seal(nil, nonce, plaintext, nil)
 	return ciphertext, nonce, nil
+}
+
+
+const StreamChunkSize = 64 * 1024 // 64 KB of plaintext per chunk
+
+// chunkNonce derives a unique nonce for each chunk by XOR-ing the last 8 bytes
+// of the base nonce with the chunk counter. This avoids storing N nonces while
+// guaranteeing every chunk uses a distinct nonce — a hard GCM requirement.
+func chunkNonce(base []byte, counter uint64) []byte {
+	n := make([]byte, len(base))
+	copy(n, base)
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], counter)
+	for i := 0; i < 8 && i < len(n); i++ {
+		n[len(n)-8+i] ^= b[i]
+	}
+	return n
+}
+
+// EncryptStream encrypts src in StreamChunkSize chunks using AES-256-GCM and
+// writes framed ciphertext to dst. Each chunk is independently authenticated,
+// so DecryptStream can verify and yield plaintext without buffering the whole file.
+//
+// Wire format: repeated [ 4-byte big-endian chunk length | GCM ciphertext+tag ]
+//
+// Returns the single base nonce that must be stored alongside the ciphertext
+// (e.g. in doc.FileNonce). All per-chunk nonces are derived from it internally.
+func EncryptStream(src io.Reader, dst io.Writer, key []byte) (nonce []byte, err error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("EncryptStream: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("EncryptStream: %w", err)
+	}
+
+	nonce = make([]byte, gcm.NonceSize())
+	if _, err = io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, fmt.Errorf("EncryptStream: nonce: %w", err)
+	}
+
+	buf := make([]byte, StreamChunkSize)
+	var counter uint64
+	var lbuf [4]byte
+
+	for {
+		n, readErr := io.ReadFull(src, buf)
+		if n > 0 {
+			ct := gcm.Seal(nil, chunkNonce(nonce, counter), buf[:n], nil)
+			binary.BigEndian.PutUint32(lbuf[:], uint32(len(ct)))
+			if _, err = dst.Write(lbuf[:]); err != nil {
+				return nil, fmt.Errorf("EncryptStream: write length: %w", err)
+			}
+			if _, err = dst.Write(ct); err != nil {
+				return nil, fmt.Errorf("EncryptStream: write chunk: %w", err)
+			}
+			counter++
+		}
+		if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
+			break
+		}
+		if readErr != nil {
+			return nil, fmt.Errorf("EncryptStream: read: %w", readErr)
+		}
+	}
+	return nonce, nil
+}
+
+// decryptReader is an io.Reader that decrypts and authenticates one GCM chunk
+// at a time. Plaintext is never returned before the GCM tag is verified, so
+// a truncated or tampered stream is caught at the chunk boundary, not at EOF.
+type decryptReader struct {
+	src     io.Reader
+	gcm     cipher.AEAD
+	base    []byte
+	counter uint64
+	buf     []byte // current decrypted chunk
+	pos     int    // read offset into buf
+	done    bool
+}
+
+func (r *decryptReader) Read(p []byte) (int, error) {
+	// Drain buffered plaintext from the last decrypted chunk first.
+	if r.pos < len(r.buf) {
+		n := copy(p, r.buf[r.pos:])
+		r.pos += n
+		return n, nil
+	}
+	if r.done {
+		return 0, io.EOF
+	}
+
+	// Read the 4-byte length prefix of the next chunk.
+	var lbuf [4]byte
+	if _, err := io.ReadFull(r.src, lbuf[:]); err != nil {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			r.done = true
+			return 0, io.EOF
+		}
+		return 0, fmt.Errorf("decryptReader: read length: %w", err)
+	}
+
+	ct := make([]byte, binary.BigEndian.Uint32(lbuf[:]))
+	if _, err := io.ReadFull(r.src, ct); err != nil {
+		return 0, fmt.Errorf("decryptReader: read chunk %d: %w", r.counter, err)
+	}
+
+	// Open authenticates and decrypts in one call — no plaintext is released
+	// if the tag check fails.
+	pt, err := r.gcm.Open(nil, chunkNonce(r.base, r.counter), ct, nil)
+	if err != nil {
+		return 0, fmt.Errorf("chunk %d authentication failed: %w", r.counter, err)
+	}
+
+	r.counter++
+	r.buf = pt
+	r.pos = 0
+
+	n := copy(p, r.buf)
+	r.pos += n
+	return n, nil
+}
+
+// DecryptStream returns an io.Reader that decrypts a chunked GCM stream
+// produced by EncryptStream. This is the function your handler should call —
+// its signature matches what your download handler already expects:
+//
+//	decryptedReader, err := crypto.DecryptStream(dataStream, doc.FileNonce, dek)
+//	io.Copy(w, decryptedReader)
+func DecryptStream(src io.Reader, nonce []byte, key []byte) (io.Reader, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("DecryptStream: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("DecryptStream: %w", err)
+	}
+	if len(nonce) != gcm.NonceSize() {
+		return nil, fmt.Errorf("DecryptStream: invalid nonce length: got %d, want %d",
+			len(nonce), gcm.NonceSize())
+	}
+	return &decryptReader{src: src, gcm: gcm, base: nonce}, nil
 }

@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"time"
@@ -40,14 +41,13 @@ func NewUploadHandler(c connectors.StorageConnector, s *metadata.Store) *UploadH
 // What this handler does in order:
 //  1. Pull KEK and UserID from context (middleware already attached both)
 //  2. Parse the multipart form to get the file stream and its metadata
-//  3. Read the file bytes into memory
-//  4. Generate a fresh DEK for this specific file
-//  5. Generate a UUID — this becomes the filename on disk
-//  6. Encrypt the file bytes with the DEK
-//  7. Encrypt the DEK with the KEK (envelope encryption)
-//  8. Write the encrypted file to storage via the connector
-//  9. Save the document metadata record to SQLite
-// 10. Return the document reference to the client
+//  3. Generate a fresh DEK for this specific file
+//  4. Generate a UUID — this becomes the filename on disk
+//  5. Stream-encrypt the file with the DEK (64 KB chunks, constant memory)
+//  6. Encrypt the DEK with the KEK (envelope encryption)
+//  7. Write the encrypted stream to storage via the connector
+//  8. Save the document metadata record to SQLite
+//  9. Return the document reference to the client
 func (h *UploadHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	// ── Step 1: Pull KEK and UserID from context ─────────────────
 	// The auth middleware already validated the JWT and attached
@@ -89,18 +89,7 @@ func (h *UploadHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	// e.g. "legal,2026" — empty string is fine, tags are optional
 	tags := r.FormValue("tags")
 
-	// ── Step 3: Read file bytes ───────────────────────────────────
-	// We read the full file into memory here because AES-GCM needs
-	// the complete plaintext to produce the authentication tag.
-	// For v0.1 this is acceptable. Streaming encryption is a later
-	// optimisation for very large files.
-	plaintext, err := io.ReadAll(file)
-	if err != nil {
-		http.Error(w, "failed to read file: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// ── Step 4: Generate a fresh DEK for this file ───────────────
+	// ── Step 3: Generate a fresh DEK for this file ───────────────
 	// Every file gets its own unique DEK.
 	// If one DEK is ever compromised, only that one file is affected.
 	dek, err := crypto.GenerateDEK()
@@ -109,50 +98,65 @@ func (h *UploadHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ── Step 5: Generate UUID storage key ────────────────────────
+	// ── Step 4: Generate UUID storage key ────────────────────────
 	// This UUID becomes the filename on disk.
 	// Using UUID means no two files ever collide regardless of their
 	// original names, and the filename reveals nothing about content.
 	storageKey := uuid.NewString()
 
-	// ── Step 6: Encrypt the file with the DEK ────────────────────
-	// Encrypt returns the ciphertext and the nonce used.
-	// We must store the nonce in the DB — it is needed for decryption.
-	// The nonce is safe to store in plaintext alongside the ciphertext.
-	encryptedFile, fileNonce, err := crypto.Encrypt(plaintext, dek)
-	if err != nil {
-		http.Error(w, "failed to encrypt file", http.StatusInternalServerError)
-		return
-	}
+	// ── Step 5: Stream-encrypt the file with the DEK ─────────────
+	// We use an io.Pipe so EncryptStream can write chunked ciphertext
+	// into the pipe writer while the connector reads from the pipe
+	// reader concurrently. Memory usage stays at one 64 KB chunk.
+	pr, pw := io.Pipe()
 
-	// ── Step 7: Encrypt the DEK with the KEK ─────────────────────
+	var fileNonce []byte
+	var encryptErr error
+
+	// Run encryption in a goroutine — it writes to pw while the
+	// connector reads from pr below.
+	go func() {
+		defer pw.Close()
+		fileNonce, encryptErr = crypto.EncryptStream(file, pw, dek)
+		if encryptErr != nil {
+			pw.CloseWithError(fmt.Errorf("encrypt stream: %w", encryptErr))
+		}
+	}()
+
+	// ── Step 6: Encrypt the DEK with the KEK ─────────────────────
 	// This is envelope encryption — the DEK is wrapped by the KEK.
 	// We store the encrypted DEK in the DB, never the plaintext DEK.
 	// The plaintext DEK exists only in memory during this request.
-	encryptedDEK, dekNonce, err := crypto.Encrypt(dek, kek)
+	encryptedDEK, dekNonce, err := crypto.WrapDEK(dek, kek)
 	if err != nil {
 		http.Error(w, "failed to encrypt document key", http.StatusInternalServerError)
 		return
 	}
 
-	// ── Step 8: Write encrypted file to storage ──────────────────
-	// We write the encrypted bytes — never the plaintext.
-	// Even if someone accesses the storage directory directly,
-	// they see only ciphertext.
+	// ── Step 7: Write encrypted stream to storage ────────────────
+	// The connector reads from the pipe — encrypted bytes stream
+	// directly to disk without ever existing fully in memory.
 	uploadReq := models.UploadRequest{
 		Key:         storageKey,
-		Content:     newBytesReader(encryptedFile), // wrap bytes as io.Reader
+		Content:     pr, // pipe reader: encrypted stream
 		ContentType: header.Header.Get("Content-Type"),
-		SizeBytes:   int64(len(encryptedFile)),
+		SizeBytes:   -1, // unknown upfront with streaming
 	}
 
-	_, err = h.connector.Upload(r.Context(), uploadReq)
+	uploadRef, err := h.connector.Upload(r.Context(), uploadReq)
 	if err != nil {
 		http.Error(w, "failed to store file", http.StatusInternalServerError)
 		return
 	}
 
-	// ── Step 9: Save metadata record ─────────────────────────────
+	// Check if encryption goroutine encountered an error
+	if encryptErr != nil {
+		h.connector.Delete(r.Context(), storageKey)
+		http.Error(w, "failed to encrypt file", http.StatusInternalServerError)
+		return
+	}
+
+	// ── Step 8: Save metadata record ─────────────────────────────
 	// This is the only thing that permanently lives on DocOps servers.
 	// The file itself lives at the storage provider (local for now).
 	doc := &models.Document{
@@ -162,7 +166,7 @@ func (h *UploadHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		Provider:     "local",
 		StorageKey:   storageKey,
 		Encrypted:    true,
-		SizeBytes:    int64(len(plaintext)), // store original size, not encrypted size
+		SizeBytes:    uploadRef.SizeBytes, // encrypted size from connector
 		Tags:         tags,
 		ExtractedText: "",        // text extraction comes in a later stage
 		EncryptedDEK: encryptedDEK,
@@ -181,7 +185,7 @@ func (h *UploadHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ── Step 10: Return document reference ───────────────────────
+	// ── Step 9: Return document reference ────────────────────────
 	// We return only the safe metadata fields.
 	// Never the DEK, never any nonce, never the storage key.
 	w.Header().Set("Content-Type", "application/json")
@@ -196,25 +200,4 @@ func (h *UploadHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		"tags":       doc.Tags,
 		"created_at": doc.CreatedAt,
 	})
-}
-
-// newBytesReader wraps a byte slice as an io.Reader.
-// Used to pass the encrypted file bytes into the connector's
-// Upload method which expects an io.Reader stream.
-func newBytesReader(b []byte) io.Reader {
-	return &bytesReader{data: b}
-}
-
-type bytesReader struct {
-	data   []byte
-	offset int
-}
-
-func (br *bytesReader) Read(p []byte) (n int, err error) {
-	if br.offset >= len(br.data) {
-		return 0, io.EOF
-	}
-	n = copy(p, br.data[br.offset:])
-	br.offset += n
-	return n, nil
 }

@@ -2,6 +2,8 @@ package crypto
 
 import (
     "bytes"
+    "crypto/rand"
+    "io"
     "testing"
 
     "github.com/Kyei-Ernest/DocOps/models"
@@ -294,7 +296,10 @@ func TestFullEncryptionFlow(t *testing.T) {
     fileContent := []byte("this is my contract pdf content")
 
     encryptedFile, fileNonce := mustEncrypt(t, fileContent, dek)
-    encryptedDEK, dekNonce := mustEncrypt(t, dek, kek)
+    encryptedDEK, dekNonce, err := WrapDEK(dek, kek)
+    if err != nil {
+        t.Fatalf("WrapDEK failed: %v", err)
+    }
 
     // ── NEW SESSION / LOGIN ──
     recoveredKEK := DeriveKEK(password, salt, DefaultArgonParams)
@@ -303,14 +308,198 @@ func TestFullEncryptionFlow(t *testing.T) {
     }
 
     // ── FILE DOWNLOAD ──
-    recoveredDEK, err := Decrypt(encryptedDEK, dekNonce, recoveredKEK)
+    recoveredDEK, err := UnwrapDEK(encryptedDEK, dekNonce, recoveredKEK)
     if err != nil {
-        t.Fatalf("failed to decrypt DEK: %v", err)
+        t.Fatalf("UnwrapDEK failed: %v", err)
     }
 
     recoveredFile, err := Decrypt(encryptedFile, fileNonce, recoveredDEK)
     if err != nil {
         t.Fatalf("failed to decrypt file: %v", err)
+    }
+
+    if !bytes.Equal(recoveredFile, fileContent) {
+        t.Fatalf("file content mismatch: expected %q got %q", fileContent, recoveredFile)
+    }
+}
+
+// ─── STREAM ENCRYPT / DECRYPT ────────────────────────────────
+
+func TestStreamEncryptDecrypt_RoundTrip(t *testing.T) {
+    key := mustGenerateDEK(t)
+    plaintext := []byte("this is my secret streamed document content")
+
+    // Encrypt
+    var cipherBuf bytes.Buffer
+    nonce, err := EncryptStream(bytes.NewReader(plaintext), &cipherBuf, key)
+    if err != nil {
+        t.Fatalf("EncryptStream failed: %v", err)
+    }
+
+    // Decrypt
+    reader, err := DecryptStream(&cipherBuf, nonce, key)
+    if err != nil {
+        t.Fatalf("DecryptStream failed: %v", err)
+    }
+    result, err := io.ReadAll(reader)
+    if err != nil {
+        t.Fatalf("reading decrypted stream failed: %v", err)
+    }
+
+    if !bytes.Equal(result, plaintext) {
+        t.Fatalf("stream round-trip mismatch: expected %q got %q", plaintext, result)
+    }
+}
+
+// TestStreamEncryptDecrypt_LargeMultiChunk verifies that files spanning
+// multiple 64 KB chunks encrypt and decrypt correctly.
+func TestStreamEncryptDecrypt_LargeMultiChunk(t *testing.T) {
+    key := mustGenerateDEK(t)
+
+    // 3.5 chunks worth of data → tests full chunks + partial final chunk
+    plaintext := make([]byte, StreamChunkSize*3+StreamChunkSize/2)
+    if _, err := rand.Read(plaintext); err != nil {
+        t.Fatalf("rand.Read: %v", err)
+    }
+
+    var cipherBuf bytes.Buffer
+    nonce, err := EncryptStream(bytes.NewReader(plaintext), &cipherBuf, key)
+    if err != nil {
+        t.Fatalf("EncryptStream failed: %v", err)
+    }
+
+    reader, err := DecryptStream(&cipherBuf, nonce, key)
+    if err != nil {
+        t.Fatalf("DecryptStream failed: %v", err)
+    }
+    result, err := io.ReadAll(reader)
+    if err != nil {
+        t.Fatalf("reading decrypted stream failed: %v", err)
+    }
+
+    if !bytes.Equal(result, plaintext) {
+        t.Fatalf("large multi-chunk round-trip failed: lengths %d vs %d", len(result), len(plaintext))
+    }
+}
+
+// TestStreamEncryptDecrypt_EmptyPlaintext ensures empty input produces
+// a valid (empty) output without panicking.
+func TestStreamEncryptDecrypt_EmptyPlaintext(t *testing.T) {
+    key := mustGenerateDEK(t)
+    plaintext := []byte{}
+
+    var cipherBuf bytes.Buffer
+    nonce, err := EncryptStream(bytes.NewReader(plaintext), &cipherBuf, key)
+    if err != nil {
+        t.Fatalf("EncryptStream failed: %v", err)
+    }
+
+    reader, err := DecryptStream(&cipherBuf, nonce, key)
+    if err != nil {
+        t.Fatalf("DecryptStream failed: %v", err)
+    }
+    result, err := io.ReadAll(reader)
+    if err != nil {
+        t.Fatalf("reading decrypted empty stream failed: %v", err)
+    }
+
+    if len(result) != 0 {
+        t.Fatalf("expected empty plaintext, got %d bytes", len(result))
+    }
+}
+
+func TestStreamDecrypt_WrongKeyFails(t *testing.T) {
+    key := mustGenerateDEK(t)
+    wrongKey := mustGenerateDEK(t)
+
+    var cipherBuf bytes.Buffer
+    nonce, err := EncryptStream(bytes.NewReader([]byte("secret stream")), &cipherBuf, key)
+    if err != nil {
+        t.Fatalf("EncryptStream failed: %v", err)
+    }
+
+    reader, err := DecryptStream(&cipherBuf, nonce, wrongKey)
+    if err != nil {
+        t.Fatalf("DecryptStream setup failed: %v", err)
+    }
+    _, err = io.ReadAll(reader)
+    if err == nil {
+        t.Fatal("decryption with wrong key should have failed but didn't")
+    }
+}
+
+func TestStreamDecrypt_TamperedChunkFails(t *testing.T) {
+    key := mustGenerateDEK(t)
+
+    var cipherBuf bytes.Buffer
+    nonce, err := EncryptStream(bytes.NewReader([]byte("secret stream")), &cipherBuf, key)
+    if err != nil {
+        t.Fatalf("EncryptStream failed: %v", err)
+    }
+
+    // Tamper with a byte inside the first chunk (after the 4-byte length prefix)
+    data := cipherBuf.Bytes()
+    if len(data) > 5 {
+        data[5] ^= 0xFF
+    }
+
+    reader, err := DecryptStream(bytes.NewReader(data), nonce, key)
+    if err != nil {
+        t.Fatalf("DecryptStream setup failed: %v", err)
+    }
+    _, err = io.ReadAll(reader)
+    if err == nil {
+        t.Fatal("decryption of tampered chunk should have failed")
+    }
+}
+
+// TestStreamFullFlow_UploadDownload simulates the complete upload/download
+// lifecycle using streaming encryption, matching how the handlers use it.
+func TestStreamFullFlow_UploadDownload(t *testing.T) {
+    password := "mypassword"
+
+    // ── REGISTRATION ──
+    salt := mustGenerateSalt(t)
+    kek := DeriveKEK(password, salt, DefaultArgonParams)
+    blob, blobNonce, err := CreateVerificationBlob(kek)
+    if err != nil {
+        t.Fatalf("CreateVerificationBlob failed: %v", err)
+    }
+
+    // ── FILE UPLOAD (streaming) ──
+    dek := mustGenerateDEK(t)
+    fileContent := []byte("this is my contract pdf content — now streamed")
+
+    var encryptedFile bytes.Buffer
+    fileNonce, err := EncryptStream(bytes.NewReader(fileContent), &encryptedFile, dek)
+    if err != nil {
+        t.Fatalf("EncryptStream failed: %v", err)
+    }
+
+    encryptedDEK, dekNonce, err := WrapDEK(dek, kek)
+    if err != nil {
+        t.Fatalf("WrapDEK failed: %v", err)
+    }
+
+    // ── NEW SESSION / LOGIN ──
+    recoveredKEK := DeriveKEK(password, salt, DefaultArgonParams)
+    if !VerifyKEK(recoveredKEK, blob, blobNonce) {
+        t.Fatal("login verification failed")
+    }
+
+    // ── FILE DOWNLOAD (streaming) ──
+    recoveredDEK, err := UnwrapDEK(encryptedDEK, dekNonce, recoveredKEK)
+    if err != nil {
+        t.Fatalf("UnwrapDEK failed: %v", err)
+    }
+
+    reader, err := DecryptStream(&encryptedFile, fileNonce, recoveredDEK)
+    if err != nil {
+        t.Fatalf("DecryptStream failed: %v", err)
+    }
+    recoveredFile, err := io.ReadAll(reader)
+    if err != nil {
+        t.Fatalf("reading decrypted stream failed: %v", err)
     }
 
     if !bytes.Equal(recoveredFile, fileContent) {
