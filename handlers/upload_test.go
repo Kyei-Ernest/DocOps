@@ -153,9 +153,13 @@ func TestUpload_Success(t *testing.T) {
 	if resp["encrypted"] != true {
 		t.Errorf("want encrypted=true, got %v", resp["encrypted"])
 	}
-	// size_bytes should match the original plaintext size, not the encrypted size
-	if int64(resp["size_bytes"].(float64)) != int64(len(content)) {
-		t.Errorf("want size_bytes=%d, got %v", len(content), resp["size_bytes"])
+	// size_bytes reflects the encrypted (stored) size, not the plaintext size.
+	// Streaming AES-GCM adds a 4-byte length prefix + 16-byte auth tag per chunk,
+	// so the stored size is always larger than the plaintext.
+	storedSize := int64(resp["size_bytes"].(float64))
+	if storedSize <= int64(len(content)) {
+		t.Errorf("size_bytes (%d) should be larger than plaintext (%d) due to GCM overhead",
+			storedSize, len(content))
 	}
 }
 

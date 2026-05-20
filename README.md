@@ -20,7 +20,7 @@
 <p align="center">
   <img alt="Go Version" src="https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat-square&logo=go&logoColor=white" />
   <img alt="License" src="https://img.shields.io/badge/License-MIT-blue?style=flat-square" />
-  <img alt="Tests" src="https://img.shields.io/badge/Tests-90_passing-brightgreen?style=flat-square" />
+  <img alt="Tests" src="https://img.shields.io/badge/Tests-120_passing-brightgreen?style=flat-square" />
   <img alt="Status" src="https://img.shields.io/badge/Status-Alpha-orange?style=flat-square" />
 </p>
 
@@ -67,6 +67,7 @@ Most document storage solutions force you to trust a third party with your plain
 │  auth.go ──── register · login · refresh · logout       │
 │  upload.go ── encrypted file upload  (POST /v1/docs)    │
 │  download.go  encrypted file download (GET /v1/docs/:id)│
+│  search.go ── full-text search       (GET /v1/docs/search)│
 ├───────────────────────────┬─────────────────────────────┤
 │  Middleware               │  Config                     │
 │  JWT validation           │  YAML + .env loader         │
@@ -154,7 +155,7 @@ go test -tags "fts5" -v ./...
 # By package
 make services_crypto_test       # 25 tests — encryption, hashing, KEK/DEK, streaming
 make services_metadata_test     # 15 tests — document CRUD, FTS5 search, isolation
-make auth_handler_test          # 25 tests — auth + upload + download handlers
+make handler_test               # 55 tests — auth, upload, download, search handlers
 make services_auth_user_test    #  2 tests — user persistence
 make services_auth_session_test #  8 tests — session lifecycle, expiry
 make auth_middleware_test        #  8 tests — JWT validation, context injection
@@ -180,6 +181,7 @@ make local_connector_test        #  7 tests — filesystem upload, download, del
 |--------|----------|-------------|
 | `POST` | `/v1/docs/upload` | Upload encrypted document (multipart/form-data) |
 | `GET`  | `/v1/docs/{docID}/download` | Download and decrypt a document (streaming) |
+| `GET`  | `/v1/docs/search?q={query}` | Full-text search across document metadata |
 
 #### Upload Request
 
@@ -213,6 +215,32 @@ curl -X GET http://localhost:8080/v1/docs/doc_a1b2c3d4-.../download \
 ```
 
 The response streams the decrypted file with appropriate `Content-Type` and `Content-Disposition` headers. Decryption happens in 64 KB chunks — memory usage is constant regardless of file size.
+
+#### Search Request
+
+```bash
+curl -X GET "http://localhost:8080/v1/docs/search?q=quarterly" \
+  -b cookies.txt
+```
+
+#### Search Response
+
+```json
+[
+  {
+    "id": "doc_a1b2c3d4-...",
+    "name": "quarterly-report.pdf",
+    "file_type": "application/pdf",
+    "encrypted": true,
+    "size_bytes": 104857,
+    "tags": "finance,2026",
+    "created_at": "2026-05-12T14:00:00Z",
+    "expires_at": null
+  }
+]
+```
+
+Search matches against document names, tags, and extracted text via the FTS5 index. Results are scoped to the authenticated user — cross-tenant results are never returned. Sensitive internal fields (`storage_key`, `encrypted_dek`, `extracted_text`) are omitted from the response.
 
 > [!IMPORTANT]
 > All document endpoints require authentication. The auth middleware injects the KEK and user ID from the server-side session — no key material is ever sent by the client.
@@ -300,8 +328,11 @@ DocOps/
 │   ├── auth.go                 # Register, login, refresh, logout
 │   ├── auth_test.go            # 14 tests
 │   ├── upload.go               # Encrypted file upload handler
-│   ├── upload_test.go          # 11 tests — upload encryption, auth, edge cases
-│   └── download.go             # Streaming decrypt + download handler
+│   ├── upload_test.go          # 12 tests — upload encryption, auth, edge cases
+│   ├── download.go             # Streaming decrypt + download handler
+│   ├── download_test.go        # 15 tests — decryption, auth, streaming, errors
+│   ├── search.go               # Full-text search handler
+│   └── search_test.go          # 14 tests — FTS5 queries, isolation, field filtering
 │
 └── connectors/
     ├── connector.go            # StorageConnector interface
@@ -316,6 +347,7 @@ DocOps/
 
 - [x] File download handler with DEK decryption
 - [x] Chunked streaming encryption/decryption (64 KB, constant memory)
+- [x] Full-text search handler with FTS5 + sensitive field filtering
 - [ ] HTTP mux wiring and route registration
 - [ ] Cloud storage connectors (S3, GCS, Google Drive)
 - [ ] Text extraction (PDF, DOCX) for search indexing

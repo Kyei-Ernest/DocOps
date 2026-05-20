@@ -31,7 +31,7 @@ services_auth_user_test:
 services_auth_session_test:
 	go test -v ./services/auth/ -run TestSession
 
-auth_handler_test:
+handler_test:
 	go test -tags "fts5" -v ./handlers/
 
 auth_middleware_test:
