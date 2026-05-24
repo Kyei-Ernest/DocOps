@@ -6,11 +6,11 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"strings"
-	"encoding/binary"
 
 	"github.com/Kyei-Ernest/DocOps/models"
 
@@ -211,16 +211,15 @@ func VerifyKEK(kek, blob, nonce []byte) bool {
 	return string(plaintext) == "docops-verify-v1"
 }
 
-
 // WrapDEK encrypts a plaintext DEK under the user's KEK for safe storage.
 func WrapDEK(dek, kek []byte) (wrappedDEK, nonce []byte, err error) {
-    return Encrypt(dek, kek)
+	return Encrypt(dek, kek)
 }
 
 // UnwrapDEK decrypts a stored wrapped DEK using the user's KEK,
 // returning the plaintext DEK ready for document encryption/decryption.
 func UnwrapDEK(wrappedDEK, nonce, kek []byte) ([]byte, error) {
-    return Decrypt(wrappedDEK, nonce, kek)
+	return Decrypt(wrappedDEK, nonce, kek)
 }
 
 // Decrypt decrypts blob using AES-256-GCM with the provided nonce and kek.
@@ -276,7 +275,6 @@ func Encrypt(plaintext, key []byte) (ciphertext, nonce []byte, err error) {
 	ciphertext = gcm.Seal(nil, nonce, plaintext, nil)
 	return ciphertext, nonce, nil
 }
-
 
 const StreamChunkSize = 64 * 1024 // 64 KB of plaintext per chunk
 

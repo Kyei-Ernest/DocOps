@@ -187,7 +187,7 @@ func (s *Store) GetByID(ctx context.Context, id, userID string) (*models.Documen
 // Note: sensitive columns (extracted_text, encryption blobs) are intentionally
 // omitted from search results to minimise exposure.
 func (s *Store) Search(ctx context.Context, userID, query string) ([]*models.Document, error) {
-    rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.db.QueryContext(ctx, `
         SELECT
             d.id, d.user_id, d.name, d.file_type,
             d.encrypted, d.size_bytes, d.tags,
@@ -196,31 +196,31 @@ func (s *Store) Search(ctx context.Context, userID, query string) ([]*models.Doc
         JOIN documents_fts fts ON d.id = fts.id
         WHERE documents_fts MATCH ? AND d.user_id = ?
         ORDER BY rank`, query, userID)
-    if err != nil {
-        return nil, fmt.Errorf("search failed: %w", err)
-    }
-    defer rows.Close()
+	if err != nil {
+		return nil, fmt.Errorf("search failed: %w", err)
+	}
+	defer rows.Close()
 
-    var results []*models.Document
-    for rows.Next() {
-        doc := &models.Document{}
-        err := rows.Scan(
-            &doc.ID,
-            &doc.UserID,
-            &doc.Name,
-            &doc.FileType,
-            &doc.Encrypted,
-            &doc.SizeBytes,
-            &doc.Tags,
-            &doc.CreatedAt,
-            &doc.ExpiresAt,
-        )
-        if err != nil {
-            return nil, err
-        }
-        results = append(results, doc)
-    }
-    return results, nil
+	var results []*models.Document
+	for rows.Next() {
+		doc := &models.Document{}
+		err := rows.Scan(
+			&doc.ID,
+			&doc.UserID,
+			&doc.Name,
+			&doc.FileType,
+			&doc.Encrypted,
+			&doc.SizeBytes,
+			&doc.Tags,
+			&doc.CreatedAt,
+			&doc.ExpiresAt,
+		)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, doc)
+	}
+	return results, nil
 }
 
 // Delete removes the document with the given ID from the database, scoped to

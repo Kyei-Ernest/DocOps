@@ -1,16 +1,31 @@
-.PHONY: build run test \
+.PHONY: setup build run test clean fmt vet \
        services_crypto_test services_metadata_test \
        services_auth_user_test services_auth_session_test \
-       auth_handler_test auth_middleware_test \
+       handler_test auth_middleware_test \
        local_connector_test
 
 # ── Build & Run ───────────────────────────────────────────────
+
+setup:
+	@./setup.sh
+
 
 build:
 	go build -tags "fts5" -o docops .
 
 run:
 	go run -tags "fts5" main.go
+
+clean:
+	rm -f docops
+
+# ── Code Quality & Formatting ─────────────────────────────────
+
+fmt:
+	go fmt ./...
+
+vet:
+	go vet -tags "fts5" ./...
 
 # ── Test All ──────────────────────────────────────────────────
 

@@ -21,7 +21,7 @@ import (
 // never creates or manages these, it just uses them.
 type UploadHandler struct {
 	connector connectors.StorageConnector // writes file to storage
-	store     *metadata.Store            // saves document record
+	store     *metadata.Store             // saves document record
 }
 
 // NewUploadHandler constructs an UploadHandler with its dependencies.
@@ -160,21 +160,21 @@ func (h *UploadHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	// This is the only thing that permanently lives on DocOps servers.
 	// The file itself lives at the storage provider (local for now).
 	doc := &models.Document{
-		ID:           "doc_" + uuid.NewString(), // unique document ID
-		Name:         header.Filename,
-		FileType:     header.Header.Get("Content-Type"),
-		Provider:     "local",
-		StorageKey:   storageKey,
-		Encrypted:    true,
-		SizeBytes:    uploadRef.SizeBytes, // encrypted size from connector
-		Tags:         tags,
-		ExtractedText: "",        // text extraction comes in a later stage
-		EncryptedDEK: encryptedDEK,
-		DEKNonce:     dekNonce,
-		FileNonce:    fileNonce,
-		UserID:       userID,
-		CreatedAt:    time.Now().UTC(),
-		ExpiresAt:    nil,
+		ID:            "doc_" + uuid.NewString(), // unique document ID
+		Name:          header.Filename,
+		FileType:      header.Header.Get("Content-Type"),
+		Provider:      "local",
+		StorageKey:    storageKey,
+		Encrypted:     true,
+		SizeBytes:     uploadRef.SizeBytes, // encrypted size from connector
+		Tags:          tags,
+		ExtractedText: "", // text extraction comes in a later stage
+		EncryptedDEK:  encryptedDEK,
+		DEKNonce:      dekNonce,
+		FileNonce:     fileNonce,
+		UserID:        userID,
+		CreatedAt:     time.Now().UTC(),
+		ExpiresAt:     nil,
 	}
 
 	if err := h.store.Save(r.Context(), doc); err != nil {

@@ -39,7 +39,7 @@ func Load(path string) (*models.Config, error) {
 			RefreshTokenTTL: "168h", // 7 days
 		},
 		Argon2: models.Argon2Config{
-			Memory:      65536,     // 64 MiB — minimum recommended for interactive logins
+			Memory:      65536, // 64 MiB — minimum recommended for interactive logins
 			Iterations:  3,
 			Parallelism: 2,
 			KeyLength:   32, // 256-bit KEK
@@ -119,6 +119,15 @@ func resolvePath(p string) string {
 // config wraps models.Config to attach behaviour (Parse) without modifying the model.
 type config struct {
 	models.Config
+}
+
+// Parse is the public entry point that converts a raw *models.Config (from Load)
+// into a fully typed *ParsedConfig ready for use by the application.
+// It delegates to the private config.Parse method, keeping the implementation
+// in one place while exposing a clean function signature to callers.
+func Parse(raw *models.Config) (*ParsedConfig, error) {
+	c := &config{Config: *raw}
+	return c.Parse()
 }
 
 // ParsedConfig holds all configuration values in their final Go types,

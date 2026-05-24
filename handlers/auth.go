@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/Kyei-Ernest/DocOps/models"
-	"github.com/Kyei-Ernest/DocOps/services/crypto"
 	authsvc "github.com/Kyei-Ernest/DocOps/services/auth"
+	"github.com/Kyei-Ernest/DocOps/services/crypto"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 )
@@ -46,7 +46,7 @@ type AuthHandler struct {
 	users     *authsvc.UserStore
 	sessions  *authsvc.SessionStore
 	params    *models.Argon2Config // shared Argon2id cost parameters (time, memory, threads)
-	jwtSecret []byte                 // HMAC-SHA256 signing key for JWTs; must stay secret
+	jwtSecret []byte               // HMAC-SHA256 signing key for JWTs; must stay secret
 }
 
 // NewAuthHandler constructs an AuthHandler with all required dependencies injected.
@@ -358,7 +358,7 @@ func (h *AuthHandler) signJWT(sessionToken string) (string, error) {
 		},
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	return token.SignedString(h.jwtSecret)  // ← JWT generated here
+	return token.SignedString(h.jwtSecret) // ← JWT generated here
 }
 
 // parseJWT validates a JWT string and returns its claims.

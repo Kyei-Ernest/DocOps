@@ -10,8 +10,6 @@ import (
 	"github.com/Kyei-Ernest/DocOps/models"
 )
 
-
-
 // LocalConnector stores files on the local filesystem.
 // basePath is the root directory where all files are written.
 // It is set once at startup from config and never changes.

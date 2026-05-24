@@ -20,7 +20,7 @@
 <p align="center">
   <img alt="Go Version" src="https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat-square&logo=go&logoColor=white" />
   <img alt="License" src="https://img.shields.io/badge/License-MIT-blue?style=flat-square" />
-  <img alt="Tests" src="https://img.shields.io/badge/Tests-120_passing-brightgreen?style=flat-square" />
+  <img alt="Tests" src="https://img.shields.io/badge/Tests-133_passing-brightgreen?style=flat-square" />
   <img alt="Status" src="https://img.shields.io/badge/Status-Alpha-orange?style=flat-square" />
 </p>
 
@@ -43,7 +43,7 @@ Most document storage solutions force you to trust a third party with your plain
 ## Features
 
 | Feature | Status | Description |
-|---------|--------|-------------|
+|:---|:---:|:---|
 | 🔑 Envelope encryption | ✅ | Per-document AES-256-GCM keys, wrapped by a user-derived KEK |
 | 🔒 Argon2id auth | ✅ | Password hashing + KEK derivation with independent salts |
 | 🍪 JWT sessions | ✅ | HttpOnly/Secure cookies with access (15m) + refresh (7d) tokens |
@@ -54,38 +54,96 @@ Most document storage solutions force you to trust a third party with your plain
 | ⚙️ YAML config | ✅ | Sensible defaults, `.env` for secrets |
 | 🛡️ Auth middleware | ✅ | JWT → session → KEK resolution per request |
 | 👥 Multi-tenant | ✅ | All operations scoped by `user_id` |
+| 🗑️ File deletion | ✅ | Secure delete from both storage connector and metadata DB |
 | ☁️ Cloud connectors | 🚧 | S3, GCS, Google Drive |
-| 📝 Text extraction | 🚧 | PDF/DOCX content extraction for search |
+| 📝 Text extraction | 🚧 | PDF/DOCX content extraction for search indexing |
 
 ---
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────┐
-│  Handlers                                               │
-│  auth.go ──── register · login · refresh · logout       │
-│  upload.go ── encrypted file upload  (POST /v1/docs)    │
-│  download.go  encrypted file download (GET /v1/docs/:id)│
-│  search.go ── full-text search       (GET /v1/docs/search)│
-├───────────────────────────┬─────────────────────────────┤
-│  Middleware               │  Config                     │
-│  JWT validation           │  YAML + .env loader         │
-│  Session → KEK injection  │  Typed ParsedConfig output  │
-├───────────────────────────┴─────────────────────────────┤
-│  Services                                               │
-│  ┌──────────┐  ┌───────────┐  ┌───────────────────┐     │
-│  │  crypto  │  │   auth    │  │     metadata      │     │
-│  │ Argon2id │  │ UserStore │  │ SQLite + FTS5     │     │
-│  │ AES-GCM  │  │ Sessions  │  │ User-scoped CRUD  │     │
-│  │ Streaming│  │           │  │                   │     │
-│  └──────────┘  └───────────┘  └───────────────────┘     │
-├─────────────────────────────────────────────────────────┤
-│  Connectors                                             │
-│  ┌───────────────┐  ┌───────────────────────────────┐   │
-│  │ local (disk)  │  │ s3 · gcs · gdrive (planned)   │   │
-│  └───────────────┘  └───────────────────────────────┘   │
-└─────────────────────────────────────────────────────────┘
+```mermaid
+graph LR
+    %% Custom styles for gorgeous look
+    classDef client fill:#f1f5f9,stroke:#64748b,stroke-width:2px,color:#0f172a;
+    classDef router fill:#e0e7ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b;
+    classDef middleware fill:#fdf2f8,stroke:#db2777,stroke-width:2px,color:#500724;
+    classDef handler fill:#faf5ff,stroke:#9333ea,stroke-width:2px,color:#3b0764;
+    classDef service fill:#f0fdf4,stroke:#16a34a,stroke-width:2px,color:#14532d;
+    classDef storage fill:#fff7ed,stroke:#ea580c,stroke-width:2px,color:#7c2d12;
+    classDef inactive fill:#fafafa,stroke:#d4d4d8,stroke-width:1px,color:#71717a,stroke-dasharray: 5 5;
+
+    %% Nodes
+    Client([🌐 Web / HTTP Client])
+    
+    subgraph Routing ["1. Entry & Routing"]
+        Mux["🛡️ Chi Router (main.go)"]
+    end
+    
+    subgraph Auth_MW ["2. Authentication Middleware"]
+        auth_mw["🔑 Auth Middleware<br/>(middleware/auth.go)"]
+    end
+    
+    subgraph Handlers ["3. Controllers & Handlers (handlers/)"]
+        auth_h["👤 Auth Handler<br/>(auth.go)"]
+        upload_h["📤 Upload Handler<br/>(upload.go)"]
+        download_h["📥 Download Handler<br/>(download.go)"]
+        search_h["🔍 Search Handler<br/>(search.go)"]
+        delete_h["🗑️ Delete Handler<br/>(delete.go)"]
+    end
+    
+    subgraph Services ["4. Core Services (services/)"]
+        auth_s["👥 Auth Service<br/>(User & Session Stores)"]
+        crypto_s["🔒 Crypto Service<br/>(Argon2id & AES-GCM)"]
+        meta_s["📝 Metadata Service<br/>(SQLite + FTS5)"]
+    end
+    
+    subgraph Storage ["5. Storage Layer (connectors/)"]
+        conn_local["💾 Local Storage<br/>(local/)"]
+        conn_cloud["☁️ Cloud Storage<br/>(Planned Connectors)"]
+    end
+
+    %% Connections
+    Client --> Mux
+    
+    %% Public Routes
+    Mux -->|"/v0.1/auth/*"| auth_h
+    
+    %% Protected Routes
+    Mux -->|"/v0.1/docs/*"| auth_mw
+    auth_mw -->|Injects KEK & UserID| upload_h
+    auth_mw -->|Injects KEK & UserID| download_h
+    auth_mw -->|Injects KEK & UserID| search_h
+    auth_mw -->|Injects KEK & UserID| delete_h
+    
+    %% Middleware resolving session
+    auth_mw -.->|Resolves Token KEK| auth_s
+    
+    %% Handler service interactions
+    auth_h -->|Register/Login/Session| auth_s
+    auth_h -->|Derive KEK via Argon2id| crypto_s
+    
+    upload_h -->|1. Stream Encrypt| crypto_s
+    upload_h -->|2. Write File| conn_local
+    upload_h -->|3. Store Metadata| meta_s
+    
+    download_h -->|1. Fetch Metadata| meta_s
+    download_h -->|2. Read File| conn_local
+    download_h -->|3. Stream Decrypt| crypto_s
+    
+    search_h -->|Query SQLite FTS5| meta_s
+    
+    delete_h -->|1. Delete Metadata| meta_s
+    delete_h -->|2. Delete File| conn_local
+
+    %% Classes
+    class Client client;
+    class Mux router;
+    class auth_mw middleware;
+    class auth_h,upload_h,download_h,search_h,delete_h handler;
+    class auth_s,crypto_s,meta_s service;
+    class conn_local storage;
+    class conn_cloud inactive;
 ```
 
 ---
@@ -94,28 +152,95 @@ Most document storage solutions force you to trust a third party with your plain
 
 DocOps uses **two-layer envelope encryption** so that compromising any single component does not expose plaintext documents:
 
-```
-Password ──▶ Argon2id ──▶ KEK (in-memory only, never persisted)
-                            │
-                            ▼
-                     ┌──────────────┐
-                     │ Encrypt DEK  │ ◀── random 256-bit DEK per document
-                     └──────┬───────┘
-                            │
-                            ▼
-                   Encrypted DEK stored in SQLite
-                   Encrypted file stored in connector
+```mermaid
+graph TD
+    subgraph Ephemeral_Memory ["💻 Ephemeral Server Memory (RAM)"]
+        direction TB
+        
+        subgraph Key_Derivation ["1. Key Derivation (At Login)"]
+            Pwd([🔑 User Password]) -->|Argon2id KDF| KEK[🔑 Key Encrypting Key - KEK]
+        end
+
+        subgraph Envelope_Encryption ["2. Envelope Encryption (At Upload)"]
+            PlainFile[📄 Plaintext Document] -->|AES-256-GCM Chunked| EncEngine{⚙️ Crypto Engine}
+            DEK[🔑 Random 256-bit DEK] -->|1. File Key| EncEngine
+            
+            KEK -->|2. Wrap Key| WrapEngine{⚙️ Key Wrapper}
+            DEK -->|Plain DEK| WrapEngine
+        end
+        
+        style Ephemeral_Memory fill:#f0fdf4,stroke:#16a34a,stroke-width:2px;
+        style Key_Derivation fill:#ffffff,stroke:#86efac,stroke-width:1px;
+        style Envelope_Encryption fill:#ffffff,stroke:#86efac,stroke-width:1px;
+    end
+
+    subgraph Persistent_Storage ["💾 Persistent Storage (Disk)"]
+        direction LR
+        
+        DB[(📝 SQLite Metadata DB)]
+        Disk[💾 File Storage / Disk]
+        
+        style Persistent_Storage fill:#fff7ed,stroke:#ea580c,stroke-width:2px;
+        style DB fill:#ffffff,stroke:#ffedd5,stroke-width:1px;
+        style Disk fill:#ffffff,stroke:#ffedd5,stroke-width:1px;
+    end
+
+    %% Flows from memory to disk
+    WrapEngine -->|3. Encrypted DEK| DB
+    EncEngine -->|4. Encrypted Content| Disk
+
+    %% Custom styling definitions
+    classDef key fill:#ecfdf5,stroke:#059669,stroke-width:1.5px,color:#065f46;
+    classDef data fill:#f0f9ff,stroke:#0284c7,stroke-width:1.5px,color:#075985;
+    classDef engine fill:#faf5ff,stroke:#7c3aed,stroke-width:1.5px,color:#581c87;
+
+    class Pwd,KEK,DEK key;
+    class PlainFile data;
+    class EncEngine,WrapEngine engine;
 ```
 
 | Property | Guarantee |
-|----------|-----------|
-| KEK storage | Never written to disk — lives in server memory for session duration only |
-| DEK uniqueness | Fresh 256-bit random key per document |
-| Nonce reuse | Each encryption call generates a fresh random nonce |
-| Password hash vs KEK | Independent Argon2id derivations with separate salts |
-| JWT contents | Opaque session token only — no key material in the token |
-| Session revocation | Server-side session store; logout invalidates immediately |
-| Timing attacks | Constant-time comparison for password verification |
+|:---|:---|
+| **KEK storage** | Never written to disk — lives in server memory for session duration only |
+| **DEK uniqueness** | Fresh 256-bit random key per document |
+| **Nonce reuse** | Each encryption call generates a fresh random nonce |
+| **Password hash vs KEK** | Independent Argon2id derivations with separate salts |
+| **JWT contents** | Opaque session token only — no key material in the token |
+| **Session revocation** | Server-side session store; logout invalidates immediately |
+| **Timing attacks** | Constant-time comparison for password verification |
+
+### Chunked Streaming Protocol
+
+To ensure constant memory usage regardless of document size, DocOps processes all document uploads and downloads via a chunked streaming envelope encryption pipeline. Plaintext data is never held fully in memory or written to disk in its raw form:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client as 🌐 HTTP Client
+    participant H as 📤 Upload Handler
+    participant C as 🔒 Crypto Service
+    participant S as 💾 Storage Connector
+    participant DB as 📝 Metadata Store
+
+    Client->>H: 1. POST /v0.1/docs/upload (Multipart Stream)
+    H->>C: 2. Generate random 256-bit DEK & IV
+    H->>C: 3. Wrap DEK using KEK from Session Context
+    C-->>H: Return Encrypted DEK
+    
+    rect rgb(240, 253, 244)
+        note over H,S: Chunked Encryption Loop (Constant Memory)
+        loop For each 64 KB chunk in multipart stream
+            H->>H: Read 64 KB Plaintext
+            H->>C: Encrypt 64 KB chunk using DEK + unique nonce
+            C-->>H: Return Encrypted chunk
+            H->>S: Stream-write Encrypted chunk to storage
+        end
+    end
+    
+    H->>DB: 4. Store Document Metadata (Encrypted DEK, size, tags, etc.)
+    DB-->>H: Metadata stored successfully
+    H-->>Client: 5. Return 201 Created (JSON metadata, sensitive fields omitted)
+```
 
 ---
 
@@ -129,13 +254,15 @@ Password ──▶ Argon2id ──▶ KEK (in-memory only, never persisted)
 
 ### Install & Run
 
+The fastest way to set up the project is to run the automated setup command. It will check your Go toolchain and C compiler (GCC/Clang), configure dependencies, and automatically generate a secure `.env` file with a cryptographically random `JWT_SECRET`:
+
 ```bash
 # Clone
 git clone https://github.com/Kyei-Ernest/DocOps.git
 cd DocOps
 
-# Set your JWT secret
-echo 'JWT_SECRET=change-me-to-a-real-secret' > .env
+# Run automated setup
+make setup
 
 # Build
 make build
@@ -144,7 +271,7 @@ make build
 make run
 ```
 
-The server starts on `http://localhost:8080` by default. No config file is required — sensible defaults are applied automatically.
+The server starts on `http://localhost:8080` by default. **All storage and database parent directories (e.g. `docops-data/`) are automatically created on startup.** No manual directory initialization or config file is required — sensible defaults are applied automatically.
 
 ### Run Tests
 
@@ -155,7 +282,7 @@ go test -tags "fts5" -v ./...
 # By package
 make services_crypto_test       # 25 tests — encryption, hashing, KEK/DEK, streaming
 make services_metadata_test     # 15 tests — document CRUD, FTS5 search, isolation
-make handler_test               # 55 tests — auth, upload, download, search handlers
+make handler_test               # 63 tests — auth, upload, download, search, delete handlers
 make services_auth_user_test    #  2 tests — user persistence
 make services_auth_session_test #  8 tests — session lifecycle, expiry
 make auth_middleware_test        #  8 tests — JWT validation, context injection
@@ -169,24 +296,25 @@ make local_connector_test        #  7 tests — filesystem upload, download, del
 ### Authentication
 
 | Method | Endpoint | Description |
-|--------|----------|-------------|
-| `POST` | `/v1/auth/register` | Create account — returns access + refresh cookies |
-| `POST` | `/v1/auth/login` | Authenticate — returns access + refresh cookies |
-| `POST` | `/v1/auth/refresh` | Exchange refresh cookie for new access cookie |
-| `POST` | `/v1/auth/logout` | Revoke sessions and clear cookies |
+|:---|:---|:---|
+| `POST` | `/v0.1/auth/register` | Create account — returns access + refresh cookies |
+| `POST` | `/v0.1/auth/login` | Authenticate — returns access + refresh cookies |
+| `POST` | `/v0.1/auth/refresh` | Exchange refresh cookie for new access cookie |
+| `POST` | `/v0.1/auth/logout` | Revoke sessions and clear cookies |
 
 ### Documents
 
 | Method | Endpoint | Description |
-|--------|----------|-------------|
-| `POST` | `/v1/docs/upload` | Upload encrypted document (multipart/form-data) |
-| `GET`  | `/v1/docs/{docID}/download` | Download and decrypt a document (streaming) |
-| `GET`  | `/v1/docs/search?q={query}` | Full-text search across document metadata |
+|:---|:---|:---|
+| `POST` | `/v0.1/docs/upload` | Upload encrypted document (multipart/form-data) |
+| `GET`  | `/v0.1/docs/{docID}/download` | Download and decrypt a document (streaming) |
+| `GET`  | `/v0.1/docs/search?q={query}` | Full-text search across document metadata |
+| `DELETE`| `/v0.1/docs/{docID}` | Securely delete document metadata and storage file |
 
 #### Upload Request
 
 ```bash
-curl -X POST http://localhost:8080/v1/docs/upload \
+curl -X POST http://localhost:8080/v0.1/docs/upload \
   -b cookies.txt \
   -F "file=@document.pdf" \
   -F "tags=legal,2026"
@@ -209,7 +337,7 @@ curl -X POST http://localhost:8080/v1/docs/upload \
 #### Download Request
 
 ```bash
-curl -X GET http://localhost:8080/v1/docs/doc_a1b2c3d4-.../download \
+curl -X GET http://localhost:8080/v0.1/docs/doc_a1b2c3d4-.../download \
   -b cookies.txt \
   -o document.pdf
 ```
@@ -219,7 +347,7 @@ The response streams the decrypted file with appropriate `Content-Type` and `Con
 #### Search Request
 
 ```bash
-curl -X GET "http://localhost:8080/v1/docs/search?q=quarterly" \
+curl -X GET "http://localhost:8080/v0.1/docs/search?q=quarterly" \
   -b cookies.txt
 ```
 
@@ -241,6 +369,17 @@ curl -X GET "http://localhost:8080/v1/docs/search?q=quarterly" \
 ```
 
 Search matches against document names, tags, and extracted text via the FTS5 index. Results are scoped to the authenticated user — cross-tenant results are never returned. Sensitive internal fields (`storage_key`, `encrypted_dek`, `extracted_text`) are omitted from the response.
+
+#### Delete Request
+
+```bash
+curl -X DELETE http://localhost:8080/v0.1/docs/doc_a1b2c3d4-... \
+  -b cookies.txt
+```
+
+#### Delete Response
+
+Returns a `204 No Content` status with an empty body upon successful deletion from both the database and physical storage connector.
 
 > [!IMPORTANT]
 > All document endpoints require authentication. The auth middleware injects the KEK and user ID from the server-side session — no key material is ever sent by the client.
@@ -285,7 +424,7 @@ argon2:
 ### Environment Variables
 
 | Variable | Required | Description |
-|----------|----------|-------------|
+|:---|:---:|:---|
 | `JWT_SECRET` | **Yes** | HMAC-SHA256 signing key for JWTs. Use ≥ 32 random bytes. |
 
 ---
@@ -332,7 +471,9 @@ DocOps/
 │   ├── download.go             # Streaming decrypt + download handler
 │   ├── download_test.go        # 15 tests — decryption, auth, streaming, errors
 │   ├── search.go               # Full-text search handler
-│   └── search_test.go          # 14 tests — FTS5 queries, isolation, field filtering
+│   ├── search_test.go          # 14 tests — FTS5 queries, isolation, field filtering
+│   ├── delete.go               # Secure document delete handler
+│   └── delete_test.go          #  9 tests — file deletion, auth, ownership verification
 │
 └── connectors/
     ├── connector.go            # StorageConnector interface
@@ -348,7 +489,8 @@ DocOps/
 - [x] File download handler with DEK decryption
 - [x] Chunked streaming encryption/decryption (64 KB, constant memory)
 - [x] Full-text search handler with FTS5 + sensitive field filtering
-- [ ] HTTP mux wiring and route registration
+- [x] HTTP mux wiring and route registration
+- [x] Secure file deletion (both connector and database layers)
 - [ ] Cloud storage connectors (S3, GCS, Google Drive)
 - [ ] Text extraction (PDF, DOCX) for search indexing
 - [ ] Document expiry and TTL enforcement
