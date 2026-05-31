@@ -12,17 +12,17 @@ import (
 )
 
 // User represents an authenticated user in the system.
-// VerificationBlob and VerificationNonce store the encrypted TOTP/verification
-// secret and its AES-GCM nonce respectively, allowing server-side decryption
-// during the verification step without exposing the plaintext secret at rest.
 type User struct {
-	ID                string
-	Email             string
-	PasswordHash      string
-	Salt              []byte
-	VerificationBlob  []byte // AES-GCM ciphertext of the verification secret
-	VerificationNonce []byte // Nonce used when encrypting VerificationBlob
-	CreatedAt         time.Time
+	ID                       string
+	Email                    string
+	PasswordHash             string
+	Salt                     []byte
+	WrappedMasterKey         []byte // Master Key wrapped with password KEK
+	MasterKeyNonce           []byte
+	RecoverySalt             []byte // Salt for recovery KEK derivation
+	RecoveryWrappedMasterKey []byte // Master Key wrapped with recovery KEK
+	RecoveryMasterKeyNonce   []byte
+	CreatedAt                time.Time
 }
 
 // UserStore wraps a SQLite database and provides user persistence operations.
@@ -45,16 +45,31 @@ func NewUserStore(db *sql.DB) (*UserStore, error) {
 func (s *UserStore) migrate() error {
 	_, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS users (
-			id                  TEXT PRIMARY KEY,
-			email               TEXT UNIQUE NOT NULL,
-			password_hash       TEXT NOT NULL,
-		  	salt                BLOB NOT NULL,
-			verification_blob   BLOB NOT NULL,
-			verification_nonce  BLOB NOT NULL,
-			created_at          DATETIME NOT NULL
+			id                            TEXT PRIMARY KEY,
+			email                         TEXT UNIQUE NOT NULL,
+			password_hash                 TEXT NOT NULL,
+		  	salt                          BLOB NOT NULL,
+			wrapped_master_key            BLOB,
+			master_key_nonce              BLOB,
+			recovery_salt                 BLOB,
+			recovery_wrapped_master_key   BLOB,
+			recovery_master_key_nonce     BLOB,
+			created_at                    DATETIME NOT NULL
 		)
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// For backward compatibility, if the table already existed without the new columns,
+	// we alter the table to add them. We ignore errors if the columns already exist.
+	s.db.Exec("ALTER TABLE users ADD COLUMN wrapped_master_key BLOB")
+	s.db.Exec("ALTER TABLE users ADD COLUMN master_key_nonce BLOB")
+	s.db.Exec("ALTER TABLE users ADD COLUMN recovery_salt BLOB")
+	s.db.Exec("ALTER TABLE users ADD COLUMN recovery_wrapped_master_key BLOB")
+	s.db.Exec("ALTER TABLE users ADD COLUMN recovery_master_key_nonce BLOB")
+
+	return nil
 }
 
 var ErrDuplicateEmail = errors.New("email already registered")
@@ -63,11 +78,18 @@ var ErrDuplicateEmail = errors.New("email already registered")
 // Returns an error if the email is already taken (UNIQUE constraint) or if
 // the insert fails for any other reason.
 func (s *UserStore) CreateUser(ctx context.Context, u *User) error {
-
 	_, err := s.db.ExecContext(ctx, `
-        INSERT INTO users (id, email, password_hash, salt, verification_blob, verification_nonce, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    `, u.ID, u.Email, u.PasswordHash, u.Salt, u.VerificationBlob, u.VerificationNonce, u.CreatedAt)
+        INSERT INTO users (
+			id, email, password_hash, salt, 
+			wrapped_master_key, master_key_nonce, 
+			recovery_salt, recovery_wrapped_master_key, recovery_master_key_nonce, 
+			created_at
+		)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, u.ID, u.Email, u.PasswordHash, u.Salt,
+		u.WrappedMasterKey, u.MasterKeyNonce,
+		u.RecoverySalt, u.RecoveryWrappedMasterKey, u.RecoveryMasterKeyNonce,
+		u.CreatedAt)
 
 	if err != nil {
 		var sqliteErr sqlite3.Error
@@ -87,19 +109,67 @@ func (s *UserStore) CreateUser(ctx context.Context, u *User) error {
 func (s *UserStore) GetByEmail(ctx context.Context, email string) (*User, error) {
 	u := &User{}
 	err := s.db.QueryRowContext(ctx, `
-		SELECT id, email, password_hash, salt, verification_blob, verification_nonce, created_at
+		SELECT id, email, password_hash, salt, 
+		       wrapped_master_key, master_key_nonce, 
+		       recovery_salt, recovery_wrapped_master_key, recovery_master_key_nonce, 
+		       created_at
 		FROM users WHERE email = ?
 	`, email).Scan(
 		&u.ID,
 		&u.Email,
 		&u.PasswordHash,
 		&u.Salt,
-		&u.VerificationBlob,
-		&u.VerificationNonce,
+		&u.WrappedMasterKey,
+		&u.MasterKeyNonce,
+		&u.RecoverySalt,
+		&u.RecoveryWrappedMasterKey,
+		&u.RecoveryMasterKeyNonce,
 		&u.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	return u, err
+}
+
+// GetByID looks up a user by their unique ID.
+func (s *UserStore) GetByID(ctx context.Context, id string) (*User, error) {
+	u := &User{}
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, email, password_hash, salt, 
+		       wrapped_master_key, master_key_nonce, 
+		       recovery_salt, recovery_wrapped_master_key, recovery_master_key_nonce, 
+		       created_at
+		FROM users WHERE id = ?
+	`, id).Scan(
+		&u.ID,
+		&u.Email,
+		&u.PasswordHash,
+		&u.Salt,
+		&u.WrappedMasterKey,
+		&u.MasterKeyNonce,
+		&u.RecoverySalt,
+		&u.RecoveryWrappedMasterKey,
+		&u.RecoveryMasterKeyNonce,
+		&u.CreatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return u, err
+}
+
+// UpdateUserKeys updates the password hash, salt, and wrapped master keys in the database.
+func (s *UserStore) UpdateUserKeys(ctx context.Context, u *User) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE users 
+		SET password_hash = ?, salt = ?, wrapped_master_key = ?, master_key_nonce = ?,
+		    recovery_salt = ?, recovery_wrapped_master_key = ?, recovery_master_key_nonce = ?
+		WHERE id = ?
+	`, u.PasswordHash, u.Salt, u.WrappedMasterKey, u.MasterKeyNonce,
+		u.RecoverySalt, u.RecoveryWrappedMasterKey, u.RecoveryMasterKeyNonce, u.ID)
+	if err != nil {
+		return fmt.Errorf("updateUserKeys: %w", err)
+	}
+	return nil
 }

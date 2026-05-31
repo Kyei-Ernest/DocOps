@@ -1,11 +1,17 @@
 package models
 
 type Config struct {
-	Server   ServerConfig   `yaml:"server"`
-	Storage  StorageConfig  `yaml:"storage"`
-	Auth     AuthConfig     `yaml:"auth"`
-	Database DatabaseConfig `yaml:"database"`
-	Argon2   Argon2Config   `yaml:"argon2"`
+	Server    ServerConfig    `yaml:"server"`
+	Storage   StorageConfig   `yaml:"storage"`
+	Auth      AuthConfig      `yaml:"auth"`
+	Database  DatabaseConfig  `yaml:"database"`
+	Argon2    Argon2Config    `yaml:"argon2"`
+	RateLimit RateLimitConfig `yaml:"rate_limit"`
+}
+
+type RateLimitConfig struct {
+	Limit  int    `yaml:"limit"`
+	Window string `yaml:"window"`
 }
 
 type ServerConfig struct {

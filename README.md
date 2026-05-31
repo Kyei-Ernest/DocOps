@@ -20,7 +20,7 @@
 <p align="center">
   <img alt="Go Version" src="https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat-square&logo=go&logoColor=white" />
   <img alt="License" src="https://img.shields.io/badge/License-MIT-blue?style=flat-square" />
-  <img alt="Tests" src="https://img.shields.io/badge/Tests-133_passing-brightgreen?style=flat-square" />
+  <img alt="Tests" src="https://img.shields.io/badge/Tests-140_passing-brightgreen?style=flat-square" />
   <img alt="Status" src="https://img.shields.io/badge/Status-Alpha-orange?style=flat-square" />
 </p>
 
@@ -55,6 +55,7 @@ Most document storage solutions force you to trust a third party with your plain
 | 🛡️ Auth middleware | ✅ | JWT → session → KEK resolution per request |
 | 👥 Multi-tenant | ✅ | All operations scoped by `user_id` |
 | 🗑️ File deletion | ✅ | Secure delete from both storage connector and metadata DB |
+| 🛡️ Rate limiting | ✅ | IP-based sliding-window rate limiting on sensitive endpoints |
 | ☁️ Cloud connectors | 🚧 | S3, GCS, Google Drive |
 | 📝 Text extraction | 🚧 | PDF/DOCX content extraction for search indexing |
 
@@ -252,9 +253,9 @@ sequenceDiagram
 - **CGO enabled** (required by `go-sqlite3`)
 - **SQLite with FTS5** support (included in most distributions)
 
-### Install & Run
+### Install & Run (Bare Metal)
 
-The fastest way to set up the project is to run the automated setup command. It will check your Go toolchain and C compiler (GCC/Clang), configure dependencies, and automatically generate a secure `.env` file with a cryptographically random `JWT_SECRET`:
+The fastest way to set up the project locally is to run the automated setup command. It will check your Go toolchain and C compiler (GCC/Clang), configure dependencies, and automatically generate a secure `.env` file with a cryptographically random `JWT_SECRET`:
 
 ```bash
 # Clone
@@ -273,6 +274,24 @@ make run
 
 The server starts on `http://localhost:8080` by default. **All storage and database parent directories (e.g. `docops-data/`) are automatically created on startup.** No manual directory initialization or config file is required — sensible defaults are applied automatically.
 
+### Run with Docker & Docker Compose
+
+If you prefer to run DocOps without installing a Go toolchain or C compilers, you can build and start it using Docker in a single command:
+
+1. **Run setup to generate a secure `.env` file:**
+   ```bash
+   make setup
+   ```
+   *(Alternatively, manually create a `.env` file containing `JWT_SECRET=your-random-32-byte-secret`)*
+
+2. **Start the service:**
+   ```bash
+   docker compose up --build -d
+   ```
+
+The application will start on `http://localhost:8080`. All SQLite databases and uploaded files are securely persisted within a dedicated Docker volume named `docops-data`.
+
+
 ### Run Tests
 
 ```bash
@@ -282,10 +301,10 @@ go test -tags "fts5" -v ./...
 # By package
 make services_crypto_test       # 25 tests — encryption, hashing, KEK/DEK, streaming
 make services_metadata_test     # 15 tests — document CRUD, FTS5 search, isolation
-make handler_test               # 63 tests — auth, upload, download, search, delete handlers
-make services_auth_user_test    #  2 tests — user persistence
-make services_auth_session_test #  8 tests — session lifecycle, expiry
-make auth_middleware_test        #  8 tests — JWT validation, context injection
+make handler_test               # 68 tests — auth, upload, download, search, delete, recovery
+make services_auth_user_test    #  3 tests — user persistence
+make services_auth_session_test #  9 tests — session lifecycle, expiry, active GC
+make auth_middleware_test        # 13 tests — JWT validation, rate limiting, context injection
 make local_connector_test        #  7 tests — filesystem upload, download, delete
 ```
 
@@ -301,6 +320,9 @@ make local_connector_test        #  7 tests — filesystem upload, download, del
 | `POST` | `/v0.1/auth/login` | Authenticate — returns access + refresh cookies |
 | `POST` | `/v0.1/auth/refresh` | Exchange refresh cookie for new access cookie |
 | `POST` | `/v0.1/auth/logout` | Revoke sessions and clear cookies |
+| `POST` | `/v0.1/auth/recover` | Recover password using offline Recovery Key |
+| `POST` | `/v0.1/auth/change-password` | Change password for authenticated users (protected) |
+| `POST` | `/v0.1/auth/rotate-master-key` | Rotates the user's Master Key and re-encrypts all document keys (protected) |
 
 ### Documents
 
@@ -452,20 +474,24 @@ DocOps/
 │   │   └── crypto_test.go      # 25 tests
 │   ├── auth/
 │   │   ├── users.go            # SQLite-backed UserStore
-│   │   ├── users_test.go       #  2 tests
+│   │   ├── users_test.go       #  3 tests
 │   │   ├── session.go          # In-memory SessionStore with lazy expiry
-│   │   └── session_test.go     #  8 tests
+│   │   └── session_test.go     #  9 tests
 │   └── metadata/
 │       ├── store.go            # Document CRUD + FTS5 search (user-scoped)
 │       └── store_test.go       # 15 tests
 │
 ├── middleware/
 │   ├── auth.go                 # JWT → session → context middleware
-│   └── auth_test.go            #  8 tests
+│   ├── auth_test.go            #  8 tests
+│   ├── ratelimit.go            # IP-based sliding-window rate limiter middleware
+│   └── ratelimit_test.go       #  5 tests
 │
 ├── handlers/
 │   ├── auth.go                 # Register, login, refresh, logout
 │   ├── auth_test.go            # 14 tests
+│   ├── recovery.go             # Password recovery, password changes, and Master Key rotation
+│   ├── recovery_test.go        #  4 tests
 │   ├── upload.go               # Encrypted file upload handler
 │   ├── upload_test.go          # 12 tests — upload encryption, auth, edge cases
 │   ├── download.go             # Streaming decrypt + download handler
@@ -491,12 +517,12 @@ DocOps/
 - [x] Full-text search handler with FTS5 + sensitive field filtering
 - [x] HTTP mux wiring and route registration
 - [x] Secure file deletion (both connector and database layers)
+- [x] Rate limiting middleware (IP-based sliding-window)
+- [x] Docker image and Compose file
 - [ ] Cloud storage connectors (S3, GCS, Google Drive)
 - [ ] Text extraction (PDF, DOCX) for search indexing
 - [ ] Document expiry and TTL enforcement
-- [ ] Rate limiting middleware
-- [ ] Structured logging (slog)
-- [ ] Docker image and Compose file
+- [x] Structured logging (slog)
 - [ ] OpenAPI specification
 
 ---

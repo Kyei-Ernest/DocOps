@@ -2,7 +2,7 @@ package handlers
 
 import (
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 
 	"github.com/Kyei-Ernest/DocOps/connectors"
@@ -96,6 +96,6 @@ func (d *DownloadHandler) Download(w http.ResponseWriter, r *http.Request) {
 	if _, err := io.Copy(w, decryptedReader); err != nil {
 		// headers already sent so we can't change status code
 		// but log it for visibility
-		log.Printf("stream copy failed for doc %s: %v", docID, err)
+		slog.Error("stream copy failed", "doc_id", docID, "error", err)
 	}
 }

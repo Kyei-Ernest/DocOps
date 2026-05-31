@@ -53,6 +53,10 @@ func Load(path string) (*models.Config, error) {
 		Database: models.DatabaseConfig{
 			Path: defaultDBPath(),
 		},
+		RateLimit: models.RateLimitConfig{
+			Limit:  5,
+			Window: "1m",
+		},
 	}
 
 	data, err := os.ReadFile(path)
@@ -145,6 +149,8 @@ type ParsedConfig struct {
 	StoragePath     string
 	DatabasePath    string
 	Argon2          models.Argon2Config
+	RateLimitLimit  int
+	RateLimitWindow time.Duration
 }
 
 // Parse converts the raw string values in the config into typed Go values
@@ -193,6 +199,11 @@ func (c *config) Parse() (*ParsedConfig, error) {
 		return nil, fmt.Errorf("invalid write_timeout %q: %w", c.Server.WriteTimeout, err)
 	}
 
+	limitWindow, err := time.ParseDuration(c.RateLimit.Window)
+	if err != nil {
+		return nil, fmt.Errorf("invalid rate_limit window %q: %w", c.RateLimit.Window, err)
+	}
+
 	return &ParsedConfig{
 		Port:            c.Server.Port,
 		ReadTimeout:     readTimeout,
@@ -203,5 +214,7 @@ func (c *config) Parse() (*ParsedConfig, error) {
 		StoragePath:     c.Storage.Local.Path,
 		DatabasePath:    c.Database.Path,
 		Argon2:          c.Argon2,
+		RateLimitLimit:  c.RateLimit.Limit,
+		RateLimitWindow: limitWindow,
 	}, nil
 }

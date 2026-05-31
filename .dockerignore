@@ -1,0 +1,24 @@
+# Git and version control
+.git
+.gitignore
+
+# Local development data
+docops-data/
+cookies.txt
+.env
+
+# Go build artifacts and binaries
+docops
+docops-data
+
+# Testing artifacts
+*.test
+*.out
+coverage/
+
+# IDE files
+.idea/
+.vscode/
+
+# System files
+.DS_Store

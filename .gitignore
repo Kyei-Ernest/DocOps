@@ -1,2 +1,20 @@
+# Secrets and Environment Config
 .env
 .env.*
+
+# Local data and cookies
+docops-data/
+cookies.txt
+
+# Go binary and build files
+docops
+*.test
+*.out
+coverage/
+
+# OS and IDE files
+.idea/
+.vscode/
+.DS_Store
+
+PITCH.md

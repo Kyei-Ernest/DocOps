@@ -1,0 +1,17 @@
+services:
+  docops:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: docops-api
+    ports:
+      - "8080:8080"
+    environment:
+      - JWT_SECRET=${JWT_SECRET}
+    volumes:
+      - docops-data:/app/docops-data
+    restart: unless-stopped
+
+volumes:
+  docops-data:
+    driver: local

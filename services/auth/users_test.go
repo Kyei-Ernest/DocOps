@@ -30,13 +30,16 @@ func TestCreateAndGetUser(t *testing.T) {
 	ctx := context.Background()
 
 	user := &User{
-		ID:                "user-001",
-		Email:             "test@docops.dev",
-		PasswordHash:      "hashed",
-		Salt:              []byte("saltsaltsaltsalt"),
-		VerificationBlob:  []byte("blob"),
-		VerificationNonce: []byte("nonce"),
-		CreatedAt:         time.Now(),
+		ID:                       "user-001",
+		Email:                    "test@docops.dev",
+		PasswordHash:             "hashed",
+		Salt:                     []byte("saltsaltsaltsalt"),
+		WrappedMasterKey:         []byte("wrapped_mk"),
+		MasterKeyNonce:           []byte("mk_nonce"),
+		RecoverySalt:             []byte("rec_salt"),
+		RecoveryWrappedMasterKey: []byte("rec_wrapped_mk"),
+		RecoveryMasterKeyNonce:   []byte("rec_mk_nonce"),
+		CreatedAt:                time.Now(),
 	}
 
 	if err := store.CreateUser(ctx, user); err != nil {
@@ -59,6 +62,9 @@ func TestCreateAndGetUser(t *testing.T) {
 	if got.Email != user.Email {
 		t.Errorf("expected email %s, got %s", user.Email, got.Email)
 	}
+	if string(got.WrappedMasterKey) != string(user.WrappedMasterKey) {
+		t.Errorf("expected WrappedMasterKey %s, got %s", user.WrappedMasterKey, got.WrappedMasterKey)
+	}
 }
 
 // TestDuplicateEmail verifies that inserting two users with the same email
@@ -68,13 +74,16 @@ func TestDuplicateEmail(t *testing.T) {
 	ctx := context.Background()
 
 	user := &User{
-		ID:                "user-001",
-		Email:             "test@docops.dev",
-		PasswordHash:      "hashed",
-		Salt:              []byte("saltsaltsaltsalt"),
-		VerificationBlob:  []byte("blob"),
-		VerificationNonce: []byte("nonce"),
-		CreatedAt:         time.Now(),
+		ID:                       "user-001",
+		Email:                    "test@docops.dev",
+		PasswordHash:             "hashed",
+		Salt:                     []byte("saltsaltsaltsalt"),
+		WrappedMasterKey:         []byte("wrapped_mk"),
+		MasterKeyNonce:           []byte("mk_nonce"),
+		RecoverySalt:             []byte("rec_salt"),
+		RecoveryWrappedMasterKey: []byte("rec_wrapped_mk"),
+		RecoveryMasterKeyNonce:   []byte("rec_mk_nonce"),
+		CreatedAt:                time.Now(),
 	}
 
 	// Seed the store with the initial user.
@@ -84,5 +93,64 @@ func TestDuplicateEmail(t *testing.T) {
 	user.ID = "user-002"
 	if err := store.CreateUser(ctx, user); err == nil {
 		t.Fatal("expected error on duplicate email, got nil")
+	}
+}
+
+// TestUpdateUserKeys verifies that user keys (password hash, salt, and wrapped master keys)
+// can be updated correctly in the database.
+func TestUpdateUserKeys(t *testing.T) {
+	store := newTestUserStore(t)
+	ctx := context.Background()
+
+	user := &User{
+		ID:                       "user-001",
+		Email:                    "test@docops.dev",
+		PasswordHash:             "hashed",
+		Salt:                     []byte("salt"),
+		WrappedMasterKey:         []byte("wrapped_mk"),
+		MasterKeyNonce:           []byte("mk_nonce"),
+		RecoverySalt:             []byte("rec_salt"),
+		RecoveryWrappedMasterKey: []byte("rec_wrapped_mk"),
+		RecoveryMasterKeyNonce:   []byte("rec_mk_nonce"),
+		CreatedAt:                time.Now(),
+	}
+
+	if err := store.CreateUser(ctx, user); err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	// Modify keys
+	user.PasswordHash = "new_hashed"
+	user.Salt = []byte("new_salt")
+	user.WrappedMasterKey = []byte("new_wrapped_mk")
+	user.MasterKeyNonce = []byte("new_mk_nonce")
+	user.RecoverySalt = []byte("new_rec_salt")
+	user.RecoveryWrappedMasterKey = []byte("new_rec_wrapped_mk")
+	user.RecoveryMasterKeyNonce = []byte("new_rec_mk_nonce")
+
+	if err := store.UpdateUserKeys(ctx, user); err != nil {
+		t.Fatalf("UpdateUserKeys failed: %v", err)
+	}
+
+	// Fetch back and verify
+	got, err := store.GetByEmail(ctx, "test@docops.dev")
+	if err != nil {
+		t.Fatalf("GetByEmail failed: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected user, got nil")
+	}
+
+	if got.PasswordHash != "new_hashed" {
+		t.Errorf("expected new password hash, got %s", got.PasswordHash)
+	}
+	if string(got.Salt) != "new_salt" {
+		t.Errorf("expected new salt, got %s", got.Salt)
+	}
+	if string(got.WrappedMasterKey) != "new_wrapped_mk" {
+		t.Errorf("expected new wrapped master key, got %s", got.WrappedMasterKey)
+	}
+	if string(got.RecoveryWrappedMasterKey) != "new_rec_wrapped_mk" {
+		t.Errorf("expected new recovery wrapped master key, got %s", got.RecoveryWrappedMasterKey)
 	}
 }

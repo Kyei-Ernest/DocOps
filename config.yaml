@@ -20,3 +20,7 @@ argon2:
   parallelism: 2
   key_length:  32
   salt_length: 16
+
+rate_limit:
+  limit: 5
+  window: "1m"

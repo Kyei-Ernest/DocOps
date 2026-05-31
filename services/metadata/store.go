@@ -249,3 +249,60 @@ func (s *Store) Delete(ctx context.Context, id, userID string) error {
 func (s *Store) Close() error {
 	return s.db.Close()
 }
+
+// ListAllForUser retrieves all documents belonging to a specific user,
+// including their key wrapping metadata (encrypted_dek, dek_nonce, file_nonce).
+// Used during Master Key rotation.
+func (s *Store) ListAllForUser(ctx context.Context, userID string) ([]*models.Document, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT
+			id, user_id, name, file_type, provider, storage_key,
+			encrypted, size_bytes, tags, extracted_text,
+			encrypted_dek, dek_nonce, file_nonce,
+			created_at, expires_at
+		FROM documents WHERE user_id = ?`, userID)
+	if err != nil {
+		return nil, fmt.Errorf("list all for user: %w", err)
+	}
+	defer rows.Close()
+
+	var results []*models.Document
+	for rows.Next() {
+		doc := &models.Document{}
+		err := rows.Scan(
+			&doc.ID,
+			&doc.UserID,
+			&doc.Name,
+			&doc.FileType,
+			&doc.Provider,
+			&doc.StorageKey,
+			&doc.Encrypted,
+			&doc.SizeBytes,
+			&doc.Tags,
+			&doc.ExtractedText,
+			&doc.EncryptedDEK,
+			&doc.DEKNonce,
+			&doc.FileNonce,
+			&doc.CreatedAt,
+			&doc.ExpiresAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scan document: %w", err)
+		}
+		results = append(results, doc)
+	}
+	return results, nil
+}
+
+// UpdateDEK updates the wrapped DEK and its nonce for a specific document.
+// Used during Master Key rotation.
+func (s *Store) UpdateDEK(ctx context.Context, docID, userID string, encryptedDEK, dekNonce []byte) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE documents
+		SET encrypted_dek = ?, dek_nonce = ?
+		WHERE id = ? AND user_id = ?`, encryptedDEK, dekNonce, docID, userID)
+	if err != nil {
+		return fmt.Errorf("update DEK: %w", err)
+	}
+	return nil
+}

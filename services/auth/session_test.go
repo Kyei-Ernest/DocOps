@@ -37,6 +37,7 @@ func mustGet(t *testing.T, store *SessionStore, token string) *Session {
 // session holds and must survive the store round-trip intact.
 func TestSessionSaveAndGet_FullRoundTrip(t *testing.T) {
 	store := NewSessionStore()
+	defer store.Close()
 	session := testSession()
 	store.Save("token-abc", session)
 
@@ -59,6 +60,7 @@ func TestSessionSaveAndGet_FullRoundTrip(t *testing.T) {
 // (nil, false) rather than panicking or returning a zero-value Session.
 func TestSessionGet_NotFound(t *testing.T) {
 	store := NewSessionStore()
+	defer store.Close()
 
 	got, ok := store.Get("nonexistent-token")
 	if ok {
@@ -74,6 +76,7 @@ func TestSessionGet_NotFound(t *testing.T) {
 // after re-authentication — the old KEK must not linger.
 func TestSessionSave_OverwritesExistingToken(t *testing.T) {
 	store := NewSessionStore()
+	defer store.Close()
 
 	original := testSession()
 	store.Save("token-abc", original)
@@ -99,6 +102,7 @@ func TestSessionSave_OverwritesExistingToken(t *testing.T) {
 
 func TestSessionGet_ExpiredToken(t *testing.T) {
 	store := NewSessionStore()
+	defer store.Close()
 
 	expired := &Session{
 		UserID:    "user-001",
@@ -118,6 +122,7 @@ func TestSessionGet_ExpiredToken(t *testing.T) {
 // not treated as valid because the clock hasn't ticked yet.
 func TestSessionGet_ExpiresAtBoundary(t *testing.T) {
 	store := NewSessionStore()
+	defer store.Close()
 
 	boundary := &Session{
 		UserID:    "user-001",
@@ -139,6 +144,7 @@ func TestSessionGet_ExpiresAtBoundary(t *testing.T) {
 
 func TestSessionDelete_RemovesSession(t *testing.T) {
 	store := NewSessionStore()
+	defer store.Close()
 	store.Save("token-abc", testSession())
 
 	// Confirm it exists before we delete it.
@@ -156,6 +162,7 @@ func TestSessionDelete_RemovesSession(t *testing.T) {
 // does not panic. Silent no-ops are acceptable; panics are not.
 func TestSessionDelete_NonexistentToken(t *testing.T) {
 	store := NewSessionStore()
+	defer store.Close()
 	// Must not panic.
 	store.Delete("never-saved-token")
 }
@@ -170,6 +177,7 @@ func TestSessionDelete_NonexistentToken(t *testing.T) {
 // every request runs in its own goroutine.
 func TestSessionStore_ConcurrentAccess(t *testing.T) {
 	store := NewSessionStore()
+	defer store.Close()
 	const goroutines = 50
 
 	var wg sync.WaitGroup
@@ -194,4 +202,53 @@ func TestSessionStore_ConcurrentAccess(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+// TestSessionStore_ActiveGC verifies that the periodic background sweeper actively
+// evicts expired sessions from memory, while keeping valid ones intact.
+func TestSessionStore_ActiveGC(t *testing.T) {
+	// Create a SessionStore with an accelerated active GC loop (10ms interval)
+	store := NewSessionStoreWithInterval(10 * time.Millisecond)
+	defer store.Close()
+
+	// 1. Save a valid, non-expired session
+	validSess := &Session{
+		UserID:    "user-valid",
+		KEK:       []byte("valid-kek-valid-kek-valid-kek-32"),
+		ExpiresAt: time.Now().Add(5 * time.Second),
+	}
+	store.Save("valid-token", validSess)
+
+	// 2. Save an expired session
+	expiredSess := &Session{
+		UserID:    "user-expired",
+		KEK:       []byte("expired-kek-expired-kek-expired-32"),
+		ExpiresAt: time.Now().Add(-1 * time.Second),
+	}
+	store.Save("expired-token", expiredSess)
+
+	// 3. Confirm both initially exist in the raw underlying map
+	store.mu.RLock()
+	_, validExists := store.sessions["valid-token"]
+	_, expiredExists := store.sessions["expired-token"]
+	store.mu.RUnlock()
+	if !validExists || !expiredExists {
+		t.Fatal("precondition failed: both sessions must exist initially in map")
+	}
+
+	// 4. Wait for the active GC sweeper ticker to trigger (50ms)
+	time.Sleep(50 * time.Millisecond)
+
+	// 5. Verify the expired session has been evicted from the map, while the valid one remains
+	store.mu.RLock()
+	_, validExistsAfter := store.sessions["valid-token"]
+	_, expiredExistsAfter := store.sessions["expired-token"]
+	store.mu.RUnlock()
+
+	if !validExistsAfter {
+		t.Error("active GC prematurely evicted a valid, non-expired session")
+	}
+	if expiredExistsAfter {
+		t.Error("active GC failed to evict an expired session from the in-memory map")
+	}
 }

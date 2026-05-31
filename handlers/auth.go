@@ -12,6 +12,7 @@ import (
 	"github.com/Kyei-Ernest/DocOps/models"
 	authsvc "github.com/Kyei-Ernest/DocOps/services/auth"
 	"github.com/Kyei-Ernest/DocOps/services/crypto"
+	"github.com/Kyei-Ernest/DocOps/services/metadata"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 )
@@ -45,6 +46,7 @@ type Claims struct {
 type AuthHandler struct {
 	users     *authsvc.UserStore
 	sessions  *authsvc.SessionStore
+	metaStore *metadata.Store
 	params    *models.Argon2Config // shared Argon2id cost parameters (time, memory, threads)
 	jwtSecret []byte               // HMAC-SHA256 signing key for JWTs; must stay secret
 }
@@ -55,12 +57,14 @@ type AuthHandler struct {
 func NewAuthHandler(
 	users *authsvc.UserStore,
 	sessions *authsvc.SessionStore,
+	metaStore *metadata.Store,
 	params *models.Argon2Config,
 	jwtSecret []byte,
 ) *AuthHandler {
 	return &AuthHandler{
 		users:     users,
 		sessions:  sessions,
+		metaStore: metaStore,
 		params:    params,
 		jwtSecret: jwtSecret,
 	}
@@ -117,35 +121,55 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ── Step 2: KEK derivation ────────────────────────────────────────────
-	// kekSalt is stored separately in the users table so it can be retrieved
-	// at login time to re-derive the same KEK deterministically.
-	// It is intentionally different from the PHC-embedded salt above.
+	// ── Step 2: Generate random 32-byte Master Key ───────────────────────
+	masterKey := make([]byte, 32)
+	if _, err := rand.Read(masterKey); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	// ── Step 3: Password KEK derivation & wrapping ───────────────────────
 	kekSalt, err := crypto.GenerateSalt()
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	kek := crypto.DeriveKEK(req.Password, kekSalt, h.params)
+	wrappedMasterKey, masterKeyNonce, err := crypto.WrapDEK(masterKey, kek)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 
-	// ── Step 3: verification blob ─────────────────────────────────────────
-	// Encrypts a known sentinel value with the KEK. At login, decrypting the
-	// sentinel with the re-derived KEK proves correctness without a second
-	// VerifyPassword call — and without storing the KEK in plaintext.
-	blob, nonce, err := crypto.CreateVerificationBlob(kek)
+	// ── Step 4: Recovery Key generation & wrapping ───────────────────────
+	recoveryKey, err := generateRecoveryKey()
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	recoverySalt, err := crypto.GenerateSalt()
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	recoveryKEK := crypto.DeriveKEK(recoveryKey, recoverySalt, h.params)
+	recoveryWrappedMasterKey, recoveryMasterKeyNonce, err := crypto.WrapDEK(masterKey, recoveryKEK)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
 	user := &authsvc.User{
-		ID:                uuid.NewString(),
-		Email:             req.Email,
-		PasswordHash:      passwordHash,
-		Salt:              kekSalt,
-		VerificationBlob:  blob,
-		VerificationNonce: nonce,
-		CreatedAt:         time.Now(),
+		ID:                       uuid.NewString(),
+		Email:                    req.Email,
+		PasswordHash:             passwordHash,
+		Salt:                     kekSalt,
+		WrappedMasterKey:         wrappedMasterKey,
+		MasterKeyNonce:           masterKeyNonce,
+		RecoverySalt:             recoverySalt,
+		RecoveryWrappedMasterKey: recoveryWrappedMasterKey,
+		RecoveryMasterKeyNonce:   recoveryMasterKeyNonce,
+		CreatedAt:                time.Now(),
 	}
 	if err := h.users.CreateUser(r.Context(), user); err != nil {
 		// Surface a conflict specifically so the caller can show a helpful message.
@@ -160,12 +184,16 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 
 	// Auto-login: issue access + refresh tokens so the client doesn't need a
 	// separate login round-trip after registration.
-	if err := h.issueSession(w, user.ID, kek); err != nil {
+	if err := h.issueSession(w, user.ID, masterKey); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]string{
+		"recovery_key": recoveryKey,
+	})
 }
 
 // Login authenticates the user and issues a fresh access + refresh session.
@@ -199,29 +227,22 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Step 1: verify the raw password against the PHC-format hash.
-	// The returned EncryptParams are discarded — KEK derivation always uses
-	// the dedicated kekSalt stored in user.Salt, not the PHC-embedded salt,
-	// so the two derivation paths remain independent.
 	if _, err := crypto.VerifyPassword(req.Password, user.PasswordHash); err != nil {
 		http.Error(w, "invalid credentials", http.StatusUnauthorized)
 		return
 	}
 
 	// Step 2: re-derive the KEK using the stored KEK salt.
-	// This must reproduce the exact same key that was created at registration.
 	kek := crypto.DeriveKEK(req.Password, user.Salt, h.params)
 
-	// Step 3: belt-and-suspenders KEK check.
-	// If Argon2id parameters changed between registration and now (e.g. a
-	// misconfiguration or accidental param upgrade), VerifyPassword would still
-	// pass but the re-derived KEK would be wrong — causing silent data loss when
-	// the user later tries to decrypt documents. Failing loudly here prevents that.
-	if !crypto.VerifyKEK(kek, user.VerificationBlob, user.VerificationNonce) {
+	// Step 3: unwrap the master key using the re-derived KEK.
+	masterKey, err := crypto.UnwrapDEK(user.WrappedMasterKey, user.MasterKeyNonce, kek)
+	if err != nil {
 		http.Error(w, "invalid credentials", http.StatusUnauthorized)
 		return
 	}
 
-	if err := h.issueSession(w, user.ID, kek); err != nil {
+	if err := h.issueSession(w, user.ID, masterKey); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -423,4 +444,14 @@ func clearCookie(w http.ResponseWriter, name string) {
 		SameSite: http.SameSiteStrictMode,
 		MaxAge:   -1,
 	})
+}
+
+// generateRecoveryKey returns a random 18-byte value encoded as raw URL-safe base64
+// prefixed with "docops_rec_".
+func generateRecoveryKey() (string, error) {
+	b := make([]byte, 18)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return "docops_rec_" + base64.RawURLEncoding.EncodeToString(b), nil
 }

@@ -41,7 +41,7 @@ services_metadata_test:
 	go test -tags "fts5" -v ./services/metadata/
 
 services_auth_user_test:
-	go test -v ./services/auth/ -run TestUser
+	go test -v ./services/auth/ -run "User|Duplicate"
 
 services_auth_session_test:
 	go test -v ./services/auth/ -run TestSession

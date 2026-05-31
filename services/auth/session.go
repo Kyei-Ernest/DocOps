@@ -21,18 +21,58 @@ type Session struct {
 // tokens to their corresponding Session. Because the KEK lives only in memory,
 // all sessions are lost on process restart and clients must re-authenticate.
 //
-// Expired sessions are evicted lazily on Get; no background sweeper is run.
-// For production use, consider adding a periodic cleanup goroutine to bound
-// unbounded memory growth from abandoned (never-deleted) sessions.
+// Expired sessions are evicted actively by a background cleanup loop running
+// periodically, as well as lazily on Get.
 type SessionStore struct {
 	mu       sync.RWMutex
 	sessions map[string]*Session
+	stopChan chan struct{}
 }
 
-// NewSessionStore returns an empty, ready-to-use SessionStore.
+// NewSessionStore returns an empty, ready-to-use SessionStore starting a
+// background garbage collection loop running every 5 minutes.
 func NewSessionStore() *SessionStore {
-	return &SessionStore{
+	return NewSessionStoreWithInterval(5 * time.Minute)
+}
+
+// NewSessionStoreWithInterval returns an empty SessionStore starting a background
+// garbage collection loop running at the specified interval.
+func NewSessionStoreWithInterval(interval time.Duration) *SessionStore {
+	s := &SessionStore{
 		sessions: make(map[string]*Session),
+		stopChan: make(chan struct{}),
+	}
+	go s.gcLoop(interval)
+	return s
+}
+
+// Close stops the background active garbage collection goroutine.
+// Must be called upon application shutdown to avoid goroutine leaks.
+func (s *SessionStore) Close() {
+	close(s.stopChan)
+}
+
+func (s *SessionStore) gcLoop(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			s.gc()
+		case <-s.stopChan:
+			return
+		}
+	}
+}
+
+func (s *SessionStore) gc() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	for token, session := range s.sessions {
+		if now.After(session.ExpiresAt) {
+			delete(s.sessions, token)
+		}
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 
 	"github.com/Kyei-Ernest/DocOps/models"
 	authsvc "github.com/Kyei-Ernest/DocOps/services/auth"
+	"github.com/Kyei-Ernest/DocOps/services/metadata"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -44,7 +45,14 @@ func newTestHandler(t *testing.T) *AuthHandler {
 	}
 
 	sessions := authsvc.NewSessionStore()
-	return NewAuthHandler(users, sessions, testParams, testJWTSecret)
+
+	metaStore, err := metadata.New(":memory:")
+	if err != nil {
+		t.Fatalf("new metadata store: %v", err)
+	}
+	t.Cleanup(func() { metaStore.Close() })
+
+	return NewAuthHandler(users, sessions, metaStore, testParams, testJWTSecret)
 }
 
 // postJSON fires a POST request with a JSON body and returns the recorder.

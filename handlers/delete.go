@@ -1,7 +1,7 @@
 package handlers
 
 import (
-	"log"
+	"log/slog"
 	"net/http"
 
 	"github.com/Kyei-Ernest/DocOps/connectors"
@@ -66,8 +66,11 @@ func (d *DeleteHandler) Delete(w http.ResponseWriter, r *http.Request) {
 
 	// ── Step 4: Delete the encrypted file from storage ───────────
 	if err := d.connector.Delete(r.Context(), doc.StorageKey); err != nil {
-		log.Printf("failed to delete storage object %s for doc %s: %v",
-			doc.StorageKey, docID, err)
+		slog.Error("failed to delete storage object",
+			"storage_key", doc.StorageKey,
+			"doc_id", docID,
+			"error", err,
+		)
 		http.Error(w, "failed to delete file from storage", http.StatusInternalServerError)
 		return
 	}
@@ -77,7 +80,10 @@ func (d *DeleteHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	// the corresponding FTS index entry.
 	if err := d.store.Delete(r.Context(), docID, userID); err != nil {
 		// Storage file is already gone — log the inconsistency.
-		log.Printf("storage deleted but metadata delete failed for doc %s: %v", docID, err)
+		slog.Error("storage deleted but metadata delete failed",
+			"doc_id", docID,
+			"error", err,
+		)
 		http.Error(w, "failed to delete document record", http.StatusInternalServerError)
 		return
 	}
