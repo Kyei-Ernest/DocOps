@@ -372,6 +372,14 @@ make local_connector_test        #  7 tests — filesystem upload, download, del
 
 ## API Reference
 
+**Interactive documentation ships with the binary:**
+
+| URL | What it is |
+|:---|:---|
+| [`/docs`](http://localhost:8080/docs) | Swagger UI — explore and try every endpoint |
+| [`/redoc`](http://localhost:8080/redoc) | Redoc — three-panel reference view |
+| `/openapi.yaml` | Raw OpenAPI 3.0 spec for codegen and tooling |
+
 ### Authentication
 
 | Method | Endpoint | Description |
@@ -631,7 +639,8 @@ DocOps/
 - [x] Graceful shutdown (connection draining)
 - [ ] Cloud storage connectors (S3, GCS, Google Drive)
 - [ ] Text extraction (PDF, DOCX) for search indexing
-- [ ] OpenAPI specification + generated SDKs
+- [x] OpenAPI 3.0 specification served at `/openapi.yaml` with Swagger UI (`/docs`) and Redoc (`/redoc`)
+- [ ] Generated SDKs (TypeScript, Python, Go)
 - [ ] Organizations & sharing model
 
 Priorities and acceptance criteria: [`ROADMAP.md`](ROADMAP.md).

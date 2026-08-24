@@ -21,7 +21,7 @@ hosting developer.
 Adoption ladder (each rung unlocks the next):
 
 1. **API-key auth path** — unblocks machine-to-machine use (P0-1)
-2. **OpenAPI spec + generated SDKs** — zero-friction evaluation and integration (P2)
+2. **OpenAPI spec ✅ shipped · generated SDKs** — zero-friction evaluation and integration (spec at `api/openapi.yaml`, viewers at `/docs` + `/redoc`)
 3. **S3-compatible connector** — one connector covers S3, R2, MinIO, Spaces (P2)
 4. **PDF/DOCX text extraction** — turns "searchable" from demo into differentiator (P2)
 5. **Orgs / sharing / scoped keys** — team adoption (P2)
@@ -217,7 +217,7 @@ already expose health checks: `db.Ping()` `main.go:60`, `connector.Ping()` `main
 | **Scoped API keys** | Read-only, tag-scoped, per-bucket grants; extends P0-1's `api_keys` table with a `scopes` column checked at the authorization layer. |
 | **Text extraction pipeline** | PDF/DOCX → `extracted_text` at upload (`metadata/store.go` FTS5 index is already wired via `documents_ai` trigger). Turns search from name/tag-only into the core differentiator. |
 | **TTL enforcement** | ✅ SHIPPED: download-time 404 gate + startup/hourly storage-first sweeper. |
-| **OpenAPI 3.1 + generated SDKs** | Spec-first with `oapi-codegen`; TypeScript/Python/Go clients; 15-minute quickstart is the adoption gate. |
+| **OpenAPI + generated SDKs** | ✅ SPEC SHIPPED: `api/openapi.yaml` (all 15 operations, both auth schemes) served at `/openapi.yaml` with Swagger UI `/docs` + Redoc `/redoc`. Remaining: generated TS/Python/Go clients + quickstart. |
 | **Orgs / sharing model** | ACL table + authorization-layer extension; ownership scoping in SQL generalizes to grant checks (`GetByID(id, userID)` → `(id, principal, acl)`). |
 | **Playground web UI** | Thin client over the API; comes last — UI is expensive, SDK-first DX is not. |
 

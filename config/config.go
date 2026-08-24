@@ -1,3 +1,5 @@
+// Package config loads and parses DocOps YAML configuration with safe defaults,
+// resolves paths, and injects secrets from the environment (never from files).
 package config
 
 import (

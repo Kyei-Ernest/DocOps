@@ -1,3 +1,6 @@
+// Package local implements StorageConnector against the local filesystem:
+// streaming uploads/downloads under UUID-named objects so on-disk layout
+// reveals nothing about content or ownership.
 package local
 
 import (

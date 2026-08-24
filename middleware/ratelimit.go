@@ -1,3 +1,10 @@
+// Package middleware provides cross-cutting HTTP concerns for DocOps:
+// authentication (session-cookie fork + stateless API-key bearer fork) with
+// context injection, and IP-based rate limiting.
+//
+// Context keys are deliberately unexported typed structs — other packages can
+// read values only through the exported accessors (KEKFromContext,
+// UserIDFromContext), never by constructing keys themselves.
 package middleware
 
 import (

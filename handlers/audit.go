@@ -1,3 +1,7 @@
+// Package handlers contains DocOps' HTTP layer: request decoding, response
+// whitelisting, and orchestration across crypto, stores, and connectors.
+// Handlers hold no business logic of their own; all cryptographic operations
+// delegate to services/crypto and all persistence to service stores.
 package handlers
 
 import (

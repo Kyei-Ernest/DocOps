@@ -1,3 +1,12 @@
+// Package crypto is DocOps' single cryptographic boundary: Argon2id password
+// hashing and KEK derivation, AES-256-GCM sealing with CSPRNG nonces, chunked
+// stream AEAD with counter-derived per-chunk nonces, AAD-bound key wraps, and
+// HKDF derivation for high-entropy machine credentials.
+//
+// NOTHING outside this package may import crypto/aes, crypto/cipher, argon2,
+// or hkdf — every primitive decision (nonce discipline, salt separation,
+// constant-time comparison) is enforced here once so callers cannot get it
+// wrong elsewhere.
 package crypto
 
 import (

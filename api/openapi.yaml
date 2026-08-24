@@ -1,0 +1,600 @@
+openapi: 3.0.3
+info:
+  title: DocOps API
+  version: 0.1.0
+  description: |
+    Self-hostable encrypted document storage API.
+
+    Every document is encrypted under its own 256-bit data key (AES-256-GCM,
+    chunked streaming); data keys are wrapped by a Master Key that exists only
+    in process RAM during active sessions and is re-derived from the user's
+    password (Argon2id) at each login. Content is never readable at rest.
+    Metadata (names, tags, extracted text) is stored in plaintext to power
+    full-text search.
+
+    ## Authentication
+
+    Two independent schemes, both injecting identical request context:
+
+    | Scheme | Audience | Mechanism |
+    |---|---|---|
+    **Cookie session** | humans, browsers | HttpOnly / Secure / SameSite=Strict `access_token` cookie carrying a JWT whose only claim is an opaque server-side session token. Instantly revocable server-side. |
+    **API key** | machines, CI | `Authorization: Bearer docops_sk_<key_id>_<secret>` — stateless per request, survives server restarts, revocable fail-closed. Secret is shown exactly once at creation and stored only as a SHA-256 hash. |
+
+    All authentication failures — bad cookie, expired session, unknown key,
+    wrong secret, revoked key, malformed input — return one byte-identical
+    `401` with no diagnostic detail. There is deliberately no way to
+    distinguish them from outside.
+
+    ## Error model
+
+    Errors are intentionally vague: plain-text bodies (`invalid credentials`,
+    `unauthorized`, `document not found`) with no stack traces, no crypto
+    oracle detail, no user enumeration. Expired documents return `404`
+    exactly like nonexistent ones.
+
+    ## Rate limiting
+
+    Public auth endpoints are IP rate-limited (default 5/min); document
+    endpoints carry their own higher ceiling (default 120/min). Exceeding
+    either returns `429` with a `Retry-After` header.
+servers:
+  - url: http://localhost:8080
+    description: Local development default
+tags:
+  - name: Auth
+    description: Registration, login, session lifecycle, recovery, key management
+  - name: API Keys
+    description: Machine credential lifecycle (bearer `docops_sk_…`)
+  - name: Documents
+    description: Encrypted upload, streaming download, search, deletion
+  - name: Ops
+    description: Liveness and readiness probes
+
+paths:
+  /healthz:
+    get:
+      tags: [Ops]
+      summary: Liveness probe
+      description: Reports whether the HTTP process is serving. Never touches backing dependencies.
+      operationId: getHealthz
+      responses:
+        '200':
+          description: Process is up.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+  /readyz:
+    get:
+      tags: [Ops]
+      summary: Readiness probe
+      description: Pings database and storage; fails closed with 503 if any dependency is unreachable. Component errors are logged server-side and never leaked through the response.
+      operationId: getReadyz
+      responses:
+        '200':
+          description: All dependencies healthy.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Readiness'
+        '503':
+          description: One or more dependencies unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Readiness'
+
+  # ── Auth ────────────────────────────────────────────────────────────────
+  /v0.1/auth/register:
+    post:
+      tags: [Auth]
+      summary: Create an account
+      description: |
+        Runs two independent Argon2id derivations (password hash + KEK salt),
+        generates a 256-bit Master Key wrapped under both the password-KEK and
+        a fresh recovery-KEK, persists the user, and auto-issues access +
+        refresh cookies. Duplicate emails return 409 by design (documented
+        tradeoff; registration is IP rate-limited).
+      operationId: register
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Credentials'
+      responses:
+        '201':
+          description: Account created. Sets `access_token` and `refresh_token` cookies. The recovery key is shown exactly once — losing it (and the password) means permanent data loss by design.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [recovery_key]
+                properties:
+                  recovery_key:
+                    type: string
+                    example: docops_rec_VaxWH4HzFADcXYEAROI3-yB-
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409':
+          description: Email already registered.
+          content:
+            text/plain:
+              schema: { type: string }
+              example: email already registered
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /v0.1/auth/login:
+    post:
+      tags: [Auth]
+      summary: Authenticate
+      description: |
+        Verifies the password against the PHC hash (constant time), re-derives
+        the KEK using the user's *persisted* KDF parameters, unwraps the
+        AAD-bound Master Key (GCM failure proves a wrong key), optionally
+        performs a lazy Argon2id upgrade if config parameters have been
+        strengthened since account creation, then issues fresh sessions.
+        Unknown email and wrong password produce identical 401s.
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Credentials'
+      responses:
+        '200':
+          description: Authenticated. Sets fresh `access_token` and `refresh_token` cookies.
+          content: {}
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /v0.1/auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Exchange refresh cookie for a new access cookie
+      description: |
+        The refresh token itself is not rotated (multi-tab safe). After a
+        server restart the durable refresh record may still be valid but the
+        Master Key died with process memory — the endpoint then returns the
+        same generic 401 and the client must fully re-authenticate. This is a
+        deliberate property: nothing able to decrypt documents rests on disk.
+      operationId: refreshToken
+      responses:
+        '200':
+          description: New `access_token` cookie set.
+          content: {}
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /v0.1/auth/logout:
+    post:
+      tags: [Auth]
+      summary: Revoke sessions and clear cookies
+      description: Evicts the access session (via the JWT's opaque token claim), deletes the RAM refresh session, revokes the durable hash-only refresh record, and always clears both cookies — even when parsing fails.
+      operationId: logout
+      security: []
+      responses:
+        '204':
+          description: Sessions revoked, cookies cleared.
+
+  /v0.1/auth/recover:
+    post:
+      tags: [Auth]
+      summary: Recover account with the offline Recovery Key
+      description: Unwraps the Master Key under a KEK derived from the shown-once recovery key (using that wrap's persisted cost parameters), re-wraps under a new password, and rotates the password hash. The recovery wrap itself is untouched.
+      operationId: recoverAccount
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, recovery_key, new_password]
+              properties:
+                email: { type: string, format: email }
+                recovery_key:
+                  type: string
+                  example: docops_rec_VaxWH4HzFADcXYEAROI3-yB-
+                new_password: { type: string, minLength: 8 }
+      responses:
+        '200':
+          description: Password replaced.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /v0.1/auth/change-password:
+    post:
+      tags: [Auth]
+      summary: Change password (protected)
+      description: Verifies the old password, re-wraps the live session Master Key under a freshly derived new-password KEK, and records the current config cost parameters on the new wrap.
+      operationId: changePassword
+      security:
+        - cookieAuth: []
+        - bearerKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [old_password, new_password]
+              properties:
+                old_password: { type: string }
+                new_password: { type: string, minLength: 8 }
+      responses:
+        '200':
+          description: Password changed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /v0.1/auth/rotate-master-key:
+    post:
+      tags: [Auth]
+      summary: Rotate the Master Key (protected)
+      description: |
+        Generates a new 256-bit Master Key and re-wraps EVERY document DEK in
+        one SQLite transaction together with the user row and a fresh recovery
+        wrap. Document ciphertext bytes are untouched. Any mid-transaction
+        failure rolls back completely — the old key remains authoritative.
+        Live sessions are patched in place so authenticated users never notice.
+        Returns the NEW recovery key once.
+      operationId: rotateMasterKey
+      security:
+        - cookieAuth: []
+        - bearerKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password: { type: string }
+      responses:
+        '200':
+          description: Rotation committed atomically.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [recovery_key, message]
+                properties:
+                  recovery_key: { type: string }
+                  message: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  # ── API keys ────────────────────────────────────────────────────────────
+  /v0.1/auth/api-keys:
+    post:
+      tags: [API Keys]
+      summary: Create an API key (protected)
+      description: |
+        Mints `docops_sk_<hex-key-id>_<base64url-secret>` where the secret is
+        32 CSPRNG bytes. The plaintext is returned EXACTLY ONCE; storage keeps
+        only SHA-256(secret) plus a per-key HKDF salt and the Master Key
+        wrapped under the HKDF-derived wrap key (AAD-bound). Creating requires
+        a live session/bearer context so the current Master Key can be wrapped.
+      operationId: createApiKey
+      security:
+        - cookieAuth: []
+        - bearerKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  description: Human label, e.g. "ci-bot".
+      responses:
+        '201':
+          description: Key created. Store `api_key` now — it is never retrievable again.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [api_key, key_id, name]
+                properties:
+                  api_key:
+                    type: string
+                    example: docops_sk_857c7a3149074b74_QdD1YsdvSHsFNMrh1DWWsH2JQfueP0gN2l8WPPL4OkY
+                  key_id: { type: string, example: "857c7a3149074b74" }
+                  name: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/Internal' }
+    get:
+      tags: [API Keys]
+      summary: List your API keys (protected)
+      description: Returns metadata only — secrets, hashes, and wraps never leave the server.
+      operationId: listApiKeys
+      security:
+        - cookieAuth: []
+        - bearerKey: []
+      responses:
+        '200':
+          description: Your keys, newest first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/APIKeyMeta'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /v0.1/auth/api-keys/{keyID}:
+    delete:
+      tags: [API Keys]
+      summary: Revoke an API key (protected)
+      description: Sets revoked_at; the key fail-closes on first subsequent use. Cross-user attempts and unknown IDs collapse into one generic 404 (no existence oracle).
+      operationId: revokeApiKey
+      security:
+        - cookieAuth: []
+        - bearerKey: []
+      parameters:
+        - name: keyID
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[0-9a-f]{16}$' }
+          example: 857c7a3149074b74
+      responses:
+        '204': { description: Revoked. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Not yours, unknown, or already revoked — indistinguishable.
+          content:
+            text/plain:
+              schema: { type: string }
+              example: api key not found
+
+  # ── Documents ───────────────────────────────────────────────────────────
+  /v0.1/docs/upload:
+    post:
+      tags: [Documents]
+      summary: Upload an encrypted document
+      description: |
+        Flow: fresh 256-bit DEK per file → stream-encrypt through 64 KB
+        AES-GCM chunks (counter-derived nonces, constant memory) → envelope-wrap
+        the DEK under your Master Key (AAD-bound to userID+docID) → write
+        ciphertext to storage under an opaque UUID → persist metadata. The
+        plaintext file exists only as a stream through this handler.
+      operationId: uploadDocument
+      security:
+        - cookieAuth: []
+        - bearerKey: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: Raw document bytes. Streamed; never buffered whole.
+                tags:
+                  type: string
+                  description: Optional comma-separated tags, e.g. "legal,2026".
+      responses:
+        '201':
+          description: Stored encrypted. Response exposes safe metadata only.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentMeta'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /v0.1/docs/{docID}/download:
+    get:
+      tags: [Documents]
+      summary: Download and decrypt a document
+      description: Unwraps the document's DEK (AAD-bound), streams chunk-by-chunk decryption where each 64 KB chunk is GCM-authenticated before release, and pipes plaintext to the client at constant memory. Foreign or nonexistent documents return identical 404s; expired documents too (TTL gate).
+      operationId: downloadDocument
+      security:
+        - cookieAuth: []
+        - bearerKey: []
+      parameters:
+        - name: docID
+          in: path
+          required: true
+          schema: { type: string }
+          example: doc_7f798558-e448-488b-8e5e-2c10fd8ddd35
+      responses:
+        '200':
+          description: Decrypted plaintext stream. Each chunk was verified before release; tampered or truncated ciphertext fails closed mid-stream.
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Not yours, nonexistent, or expired — indistinguishable.
+          content:
+            text/plain:
+              schema: { type: string }
+              example: document not found
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /v0.1/docs/search:
+    get:
+      tags: [Documents]
+      summary: Full-text search across your documents
+      description: SQLite FTS5 MATCH query over names, tags, and extracted text, JOIN-scoped by owner in SQL and ordered by relevance rank. Supports FTS5 query syntax (e.g. `invoice AND 2024`). Sensitive columns are excluded from results by construction.
+      operationId: searchDocuments
+      security:
+        - cookieAuth: []
+        - bearerKey: []
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema: { type: string, minLength: 1 }
+          example: invoice AND 2024
+      responses:
+        '200':
+          description: Matching documents owned by you.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SearchHit'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /v0.1/docs/{docID}:
+    delete:
+      tags: [Documents]
+      summary: Delete a document
+      description: Removes the storage object FIRST, then the metadata row (so failure mode is a recoverable orphaned row, never a dangling pointer). FTS entry purged via trigger. RowsAffected==0 yields the same generic 404 as every other miss.
+      operationId: deleteDocument
+      security:
+        - cookieAuth: []
+        - bearerKey: []
+      parameters:
+        - name: docID
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '204': { description: Deleted. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Not yours or nonexistent — indistinguishable.
+          content:
+            text/plain:
+              schema: { type: string }
+              example: document not found
+        '500': { $ref: '#/components/responses/Internal' }
+
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: access_token
+      description: HttpOnly JWT whose sole claim is an opaque server-side session token. Issued by /register, /login, /refresh.
+    bearerKey:
+      type: http
+      scheme: bearer
+      description: 'Machine credential: docops_sk_<key_id>_<secret>. Created via POST /v0.1/auth/api-keys; secret shown exactly once.'
+
+  responses:
+    BadRequest:
+      description: Malformed request body or missing required field.
+      content:
+        text/plain:
+          schema: { type: string }
+          example: invalid request body
+    Unauthorized:
+      description: |
+        Authentication failed. Byte-identical for: missing/expired cookie, dead
+        session, unknown key ID, wrong secret, revoked key, malformed key — by
+        design, no oracle.
+      content:
+        text/plain:
+          schema: { type: string }
+          example: unauthorized
+    RateLimited:
+      description: IP fixed-window limit exceeded for this route group.
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: Seconds until the window resets.
+      content:
+        text/plain:
+          schema: { type: string }
+          example: 'Rate limit exceeded. Please try again later.'
+    Internal:
+      description: Something failed server-side; details stay in structured logs, never in the response.
+      content:
+        text/plain:
+          schema: { type: string }
+          example: internal error
+
+  schemas:
+    Credentials:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, minLength: 1 }
+    Message:
+      type: object
+      required: [message]
+      properties:
+        message: { type: string, example: Password changed successfully }
+    HealthStatus:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [ok] }
+    Readiness:
+      type: object
+      required: [status, database, storage]
+      properties:
+        status: { type: string, enum: [ok, unavailable] }
+        database: { type: string, enum: [ok, unavailable] }
+        storage: { type: string, enum: [ok, unavailable] }
+    APIKeyMeta:
+      type: object
+      required: [key_id, name, created_at, revoked]
+      properties:
+        key_id: { type: string, example: 857c7a3149074b74 }
+        name: { type: string, example: ci-bot }
+        created_at: { type: string, format: date-time }
+        last_used_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Throttled to hourly granularity by design.
+        revoked: { type: boolean }
+    DocumentMeta:
+      type: object
+      required: [id, name, size_bytes, encrypted, created_at]
+      properties:
+        id: { type: string, example: doc_7f798558-e448-488b-8e5e-2c10fd8ddd35 }
+        name: { type: string, example: report.pdf }
+        file_type: { type: string, example: application/pdf }
+        size_bytes: { type: integer, format: int64, description: Ciphertext size as written to storage. }
+        encrypted: { type: boolean, example: true }
+        tags: { type: string, example: 'legal,2026' }
+        created_at: { type: string, format: date-time }
+    SearchHit:
+      type: object
+      required: [id, name, encrypted, size_bytes, created_at]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        file_type: { type: string, nullable: true }
+        encrypted: { type: boolean }
+        size_bytes: { type: integer, format: int64 }
+        tags: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time, nullable: true }

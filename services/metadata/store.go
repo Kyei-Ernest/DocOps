@@ -1,3 +1,7 @@
+// Package metadata owns the documents table: CRUD scoped by owner in SQL,
+// an FTS5 external-content search index kept coherent by insert/delete
+// triggers, shared-pool transactions (InTx) for multi-row mutations such as
+// atomic key rotation, and TTL sweep helpers.
 package metadata
 
 import (

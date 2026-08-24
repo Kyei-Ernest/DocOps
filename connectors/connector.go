@@ -1,3 +1,6 @@
+// Package connectors defines the storage backend abstraction: every document
+// byte passes through a StorageConnector, so new backends (S3, GCS) slot in
+// without touching handler or crypto code.
 package connectors
 
 import (

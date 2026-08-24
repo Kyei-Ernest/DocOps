@@ -1,3 +1,7 @@
+// Package auth persists identity and credentials: the SQLite user store
+// (with per-user persisted KDF parameters), the in-memory session store that
+// holds Master Keys in RAM only, the stateless API-key store backing bearer
+// authentication, and hash-only durable refresh-token identities.
 package auth
 
 import (

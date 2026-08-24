@@ -1,3 +1,6 @@
+// Package main wires the DocOps application together: configuration loading,
+// store construction on a shared SQLite pool, HTTP handler assembly, chi route
+// registration, the TTL sweeper, and graceful server lifecycle.
 package main
 
 import (
@@ -13,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Kyei-Ernest/DocOps/api"
 	"github.com/Kyei-Ernest/DocOps/config"
 	"github.com/Kyei-Ernest/DocOps/connectors/local"
 	"github.com/Kyei-Ernest/DocOps/handlers"
@@ -130,6 +134,12 @@ func main() {
 	// reports component status without leaking internal error detail.
 	r.Get("/healthz", healthHandler.Live)
 	r.Get("/readyz", healthHandler.Ready)
+
+	// API documentation — raw OpenAPI spec plus interactive viewers
+	// (Swagger UI and Redoc pull their assets from public CDNs).
+	r.Get("/openapi.yaml", api.Spec)
+	r.Get("/docs", api.SwaggerUI)
+	r.Get("/redoc", api.Redoc)
 
 	// Create an IP-based rate limiter for auth endpoints. Proxy headers are
 	// honored only when explicitly configured (trust_proxy_headers) — see

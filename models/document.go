@@ -1,3 +1,8 @@
+// Package models defines DocOps' data transfer objects: documents, users'
+// crypto material, storage DTOs, and the YAML configuration schema.
+// Sensitive fields are marked json:"-" so accidental serialization can never
+// leak key material; responses are additionally whitelisted field maps at the
+// handler layer (defense in two layers).
 package models
 
 import "time"
