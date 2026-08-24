@@ -46,11 +46,15 @@ func newTestHandler(t *testing.T) *AuthHandler {
 
 	sessions := authsvc.NewSessionStore()
 
-	metaStore, err := metadata.New(":memory:")
+	// Metadata store shares the SAME *sql.DB pool as the user store — this
+	// mirrors main.go and is what allows rotation to span documents + users
+	// tables in a single transaction.
+	metaStore, err := metadata.NewDB(db)
 	if err != nil {
 		t.Fatalf("new metadata store: %v", err)
 	}
-	t.Cleanup(func() { metaStore.Close() })
+	// No separate Close: NewDB does not own the connection; db.Close below
+	// releases everything.
 
 	return NewAuthHandler(users, sessions, metaStore, testParams, testJWTSecret)
 }

@@ -19,16 +19,32 @@ type RateLimiter struct {
 	visitors map[string]*visitor
 	limit    int
 	window   time.Duration
-	stopChan chan struct{}
+	// trustProxyHeaders gates whether X-Forwarded-For / X-Real-IP may
+	// override RemoteAddr. These headers are client-controlled input; when
+	// false (the default) they are ignored entirely so a directly-exposed
+	// server cannot be bypassed by header spoofing. Enable only behind a
+	// proxy that sanitizes or overwrites them.
+	trustProxyHeaders bool
+	stopChan          chan struct{}
 }
 
 // NewRateLimiter creates a new RateLimiter instance and starts the background cleanup loop.
+// Proxy headers are never trusted; use NewRateLimiterWithTrust behind a
+// sanitizing reverse proxy.
 func NewRateLimiter(limit int, window time.Duration) *RateLimiter {
+	return NewRateLimiterWithTrust(limit, window, false)
+}
+
+// NewRateLimiterWithTrust is NewRateLimiter with explicit control over proxy-header
+// trust. Only pass true when requests arrive via a proxy that overwrites (not
+// merely appends to) X-Forwarded-For — otherwise callers own their identity.
+func NewRateLimiterWithTrust(limit int, window time.Duration, trustProxyHeaders bool) *RateLimiter {
 	rl := &RateLimiter{
-		visitors: make(map[string]*visitor),
-		limit:    limit,
-		window:   window,
-		stopChan: make(chan struct{}),
+		visitors:          make(map[string]*visitor),
+		limit:             limit,
+		window:            window,
+		trustProxyHeaders: trustProxyHeaders,
+		stopChan:          make(chan struct{}),
 	}
 	go rl.cleanupLoop()
 	return rl
@@ -72,11 +88,16 @@ func (rl *RateLimiter) Limit(next http.Handler) http.Handler {
 			ip = r.RemoteAddr
 		}
 
-		// Support common proxy headers for IP identification
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			ip = xff
-		} else if xrip := r.Header.Get("X-Real-IP"); xrip != "" {
-			ip = xrip
+		// Support common proxy headers for IP identification — but only when
+		// explicitly configured. Unconditionally trusting these lets any
+		// client rotate its apparent IP per request (bypassing the limit)
+		// or pin a victim's real IP into persistent 429s.
+		if rl.trustProxyHeaders {
+			if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+				ip = xff
+			} else if xrip := r.Header.Get("X-Real-IP"); xrip != "" {
+				ip = xrip
+			}
 		}
 
 		rl.mu.Lock()

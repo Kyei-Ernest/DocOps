@@ -112,10 +112,10 @@ func TestRateLimit_IPIsolation(t *testing.T) {
 	}
 }
 
-func TestRateLimit_ProxyHeaders(t *testing.T) {
+func TestRateLimit_ProxyHeadersTrustedMode(t *testing.T) {
 	limit := 1
 	window := 200 * time.Millisecond
-	rl := middleware.NewRateLimiter(limit, window)
+	rl := middleware.NewRateLimiterWithTrust(limit, window, true)
 	defer rl.Close()
 
 	handler := rl.Limit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -140,6 +140,42 @@ func TestRateLimit_ProxyHeaders(t *testing.T) {
 	handler.ServeHTTP(rr2, req2)
 	if rr2.Code != http.StatusTooManyRequests {
 		t.Fatalf("want 429, got %d", rr2.Code)
+	}
+}
+
+// In the default (untrusted) mode, client-supplied proxy headers must be
+// ignored entirely — otherwise an attacker rotates their apparent IP per
+// request and the limit never applies.
+func TestRateLimit_ProxyHeadersIgnoredByDefault(t *testing.T) {
+	limit := 1
+	window := 200 * time.Millisecond
+	rl := middleware.NewRateLimiter(limit, window)
+	defer rl.Close()
+
+	handler := rl.Limit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// First request consumes the budget.
+	req1 := httptest.NewRequest(http.MethodGet, "/", nil)
+	req1.RemoteAddr = "10.0.0.1:1000"
+	req1.Header.Set("X-Forwarded-For", "5.5.5.5")
+	rr1 := httptest.NewRecorder()
+	handler.ServeHTTP(rr1, req1)
+	if rr1.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", rr1.Code)
+	}
+
+	// Second request from the SAME RemoteAddr but a DIFFERENT spoofed XFF:
+	// must still count against 10.0.0.1 and be blocked, not start a fresh
+	// window under the attacker-chosen identity.
+	req2 := httptest.NewRequest(http.MethodGet, "/", nil)
+	req2.RemoteAddr = "10.0.0.1:1000"
+	req2.Header.Set("X-Forwarded-For", "6.6.6.6")
+	rr2 := httptest.NewRecorder()
+	handler.ServeHTTP(rr2, req2)
+	if rr2.Code != http.StatusTooManyRequests {
+		t.Fatalf("want 429 despite spoofed XFF, got %d", rr2.Code)
 	}
 }
 

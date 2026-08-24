@@ -18,3 +18,6 @@ coverage/
 .DS_Store
 
 PITCH.md
+
+# Local AI agent instructions
+AGENTS.md

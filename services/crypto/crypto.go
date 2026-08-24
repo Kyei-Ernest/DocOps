@@ -130,6 +130,42 @@ func VerifyPassword(password, encoded string) (*models.EncryptParams, error) {
 	return &models.EncryptParams{Salt: salt}, nil
 }
 
+// ParsePHCParams extracts the cost parameters embedded in a PHC-formatted
+// Argon2id hash without verifying anything. Used by the lazy KDF-upgrade path,
+// which compares stored parameters against current configuration.
+func ParsePHCParams(encoded string) (memory, iterations, parallelism uint32, err error) {
+	parts := strings.Split(encoded, "$")
+	if len(parts) != 6 {
+		return 0, 0, 0, ErrInvalidHash
+	}
+	if _, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &memory, &iterations, &parallelism); err != nil {
+		return 0, 0, 0, ErrInvalidHash
+	}
+	return memory, iterations, parallelism, nil
+}
+
+// NeedsRehash reports whether a PHC-encoded hash was produced with materially
+// weaker parameters than the given target configuration, meaning the next
+// successful authentication should transparently rehash-and-rewrap.
+//
+// Policy: upgrade only when every target parameter is >= the stored value and
+// at least one is strictly greater. A mixed comparison (target stronger on one
+// axis, weaker on another) never upgrades — silently weakening some dimension
+// of an existing hash would be worse than leaving it stale.
+func NeedsRehash(encoded string, target *models.Argon2Config) (bool, error) {
+	memory, iterations, parallelism, err := ParsePHCParams(encoded)
+	if err != nil {
+		return false, err
+	}
+	atLeastEqual := target.Memory >= memory &&
+		target.Iterations >= iterations &&
+		uint32(target.Parallelism) >= parallelism
+	strictlyGreater := target.Memory > memory ||
+		target.Iterations > iterations ||
+		uint32(target.Parallelism) > parallelism
+	return atLeastEqual && strictlyGreater, nil
+}
+
 // ParsePHCString extracts the raw Argon2id hash bytes from a PHC-formatted
 // string. It does not verify the hash — use VerifyPassword for that.
 // Intended for callers that need the raw hash bytes for a secondary purpose
@@ -211,9 +247,37 @@ func VerifyKEK(kek, blob, nonce []byte) bool {
 	return string(plaintext) == "docops-verify-v1"
 }
 
+// AAD domain builders. Every wrapped key is cryptographically bound to the
+// identity of what it protects, so a valid-looking blob lifted from one row
+// and planted into another fails GCM authentication instead of decrypting
+// successfully (confused-deputy defense, ROADMAP P0-4).
+func DEKAAD(userID, docID string) []byte {
+	return []byte("docops-dek-v1|" + userID + "|" + docID)
+}
+
+func MasterKeyAAD(userID string) []byte {
+	return []byte("docops-master-v1|" + userID)
+}
+
+func RecoveryKeyAAD(userID string) []byte {
+	return []byte("docops-recovery-v1|" + userID)
+}
+
+func APIKeyAAD(userID, keyID string) []byte {
+	return []byte("docops-apikey-v1|" + userID + "|" + keyID)
+}
+
 // WrapDEK encrypts a plaintext DEK under the user's KEK for safe storage.
+// Prefer the AAD-bound variant for all new code paths.
 func WrapDEK(dek, kek []byte) (wrappedDEK, nonce []byte, err error) {
 	return Encrypt(dek, kek)
+}
+
+// WrapDEKBound is WrapDEK with Additional Authenticated Data binding: the
+// resulting blob can only be opened with both the correct key AND the exact
+// same AAD context it was sealed under.
+func WrapDEKBound(dek, kek, aad []byte) (wrappedDEK, nonce []byte, err error) {
+	return sealAad(dek, kek, aad)
 }
 
 // UnwrapDEK decrypts a stored wrapped DEK using the user's KEK,
@@ -222,12 +286,37 @@ func UnwrapDEK(wrappedDEK, nonce, kek []byte) ([]byte, error) {
 	return Decrypt(wrappedDEK, nonce, kek)
 }
 
+// UnwrapDEKBound opens an AAD-bound wrap produced by WrapDEKBound.
+func UnwrapDEKBound(wrappedDEK, nonce, kek, aad []byte) ([]byte, error) {
+	return openAad(wrappedDEK, nonce, kek, aad)
+}
+
+// UnwrapDEKAny opens a wrapped DEK that may be either AAD-bound (current
+// format) or legacy unbound (rows written before ROADMAP P0-4 shipped).
+//
+// Order matters and is not an oracle: the bound attempt runs first, and both
+// failures are indistinguishable GCM authentication errors. Rows still in the
+// legacy format are upgraded to bound wraps the next time Master Key rotation
+// runs, since rotation re-wraps every DEK with binding.
+func UnwrapDEKAny(wrappedDEK, nonce, kek, aad []byte) ([]byte, error) {
+	if len(aad) > 0 {
+		if pt, err := openAad(wrappedDEK, nonce, kek, aad); err == nil {
+			return pt, nil
+		}
+	}
+	return Decrypt(wrappedDEK, nonce, kek)
+}
+
 // Decrypt decrypts blob using AES-256-GCM with the provided nonce and kek.
 // The GCM authentication tag (appended to the ciphertext by Encrypt) is
 // verified automatically — if the blob or nonce has been tampered with,
 // gcm.Open returns an error and no plaintext is ever returned.
 func Decrypt(blob, nonce, kek []byte) ([]byte, error) {
-	block, err := aes.NewCipher(kek)
+	return openAad(blob, nonce, kek, nil)
+}
+
+func openAad(blob, nonce, key, aad []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
 	}
@@ -238,7 +327,7 @@ func Decrypt(blob, nonce, kek []byte) ([]byte, error) {
 	if len(nonce) != gcm.NonceSize() {
 		return nil, fmt.Errorf("invalid nonce length: got %d, want %d", len(nonce), gcm.NonceSize())
 	}
-	decrypted, err := gcm.Open(nil, nonce, blob, nil)
+	decrypted, err := gcm.Open(nil, nonce, blob, aad)
 	if err != nil {
 		return nil, fmt.Errorf("decryption failed: %w", err)
 	}
@@ -258,6 +347,12 @@ func Decrypt(blob, nonce, kek []byte) ([]byte, error) {
 // gcm.Seal/Open if you need to bind ciphertext to a specific context (e.g. a
 // document ID) without encrypting that context.
 func Encrypt(plaintext, key []byte) (ciphertext, nonce []byte, err error) {
+	return sealAad(plaintext, key, nil)
+}
+
+// sealAad is the single GCM sealing path: fresh 96-bit CSPRNG nonce per call,
+// optional AAD binding, tag appended to ciphertext.
+func sealAad(plaintext, key, aad []byte) (ciphertext, nonce []byte, err error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create cipher: %w", err)
@@ -272,7 +367,7 @@ func Encrypt(plaintext, key []byte) (ciphertext, nonce []byte, err error) {
 		return nil, nil, fmt.Errorf("failed to generate nonce: %w", err)
 	}
 
-	ciphertext = gcm.Seal(nil, nonce, plaintext, nil)
+	ciphertext = gcm.Seal(nil, nonce, plaintext, aad)
 	return ciphertext, nonce, nil
 }
 

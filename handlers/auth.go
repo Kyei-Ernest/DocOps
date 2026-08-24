@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -37,6 +38,15 @@ type Claims struct {
 	jwt.RegisteredClaims
 }
 
+// sessionManager is the minimal session capability the auth handlers need.
+// Consumer-side interface: the concrete in-memory *authsvc.SessionStore satisfies
+// it implicitly, and tests can substitute fakes without a real store running.
+type sessionManager interface {
+	Save(token string, session *authsvc.Session)
+	Get(token string) (*authsvc.Session, bool)
+	Delete(token string)
+}
+
 // AuthHandler handles registration, login, token refresh, and logout.
 //
 // It is intentionally the only place that coordinates across the crypto,
@@ -45,8 +55,12 @@ type Claims struct {
 // lives in the authsvc package.
 type AuthHandler struct {
 	users     *authsvc.UserStore
-	sessions  *authsvc.SessionStore
+	sessions  sessionManager
 	metaStore *metadata.Store
+	// refresh is optional (nil in legacy tests): when present, issued refresh
+	// tokens are durably recorded hash-only, so revocation and audit survive
+	// process restarts. Key material is never persisted here.
+	refresh   *authsvc.RefreshTokenStore
 	params    *models.Argon2Config // shared Argon2id cost parameters (time, memory, threads)
 	jwtSecret []byte               // HMAC-SHA256 signing key for JWTs; must stay secret
 }
@@ -56,8 +70,20 @@ type AuthHandler struct {
 // from a CSPRNG) and that params reflect an appropriate Argon2id work factor.
 func NewAuthHandler(
 	users *authsvc.UserStore,
-	sessions *authsvc.SessionStore,
+	sessions sessionManager,
 	metaStore *metadata.Store,
+	params *models.Argon2Config,
+	jwtSecret []byte,
+) *AuthHandler {
+	return NewAuthHandlerWithRefresh(users, sessions, metaStore, nil, params, jwtSecret)
+}
+
+// NewAuthHandlerWithRefresh additionally wires the durable refresh-token store.
+func NewAuthHandlerWithRefresh(
+	users *authsvc.UserStore,
+	sessions sessionManager,
+	metaStore *metadata.Store,
+	refresh *authsvc.RefreshTokenStore,
 	params *models.Argon2Config,
 	jwtSecret []byte,
 ) *AuthHandler {
@@ -65,6 +91,7 @@ func NewAuthHandler(
 		users:     users,
 		sessions:  sessions,
 		metaStore: metaStore,
+		refresh:   refresh,
 		params:    params,
 		jwtSecret: jwtSecret,
 	}
@@ -127,6 +154,7 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	userID := uuid.NewString()
 
 	// ── Step 3: Password KEK derivation & wrapping ───────────────────────
 	kekSalt, err := crypto.GenerateSalt()
@@ -135,7 +163,8 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	kek := crypto.DeriveKEK(req.Password, kekSalt, h.params)
-	wrappedMasterKey, masterKeyNonce, err := crypto.WrapDEK(masterKey, kek)
+	// Both master-key wraps are AAD-bound to the owner's identity (P0-4).
+	wrappedMasterKey, masterKeyNonce, err := crypto.WrapDEKBound(masterKey, kek, crypto.MasterKeyAAD(userID))
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -153,14 +182,14 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	recoveryKEK := crypto.DeriveKEK(recoveryKey, recoverySalt, h.params)
-	recoveryWrappedMasterKey, recoveryMasterKeyNonce, err := crypto.WrapDEK(masterKey, recoveryKEK)
+	recoveryWrappedMasterKey, recoveryMasterKeyNonce, err := crypto.WrapDEKBound(masterKey, recoveryKEK, crypto.RecoveryKeyAAD(userID))
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
 	user := &authsvc.User{
-		ID:                       uuid.NewString(),
+		ID:                       userID,
 		Email:                    req.Email,
 		PasswordHash:             passwordHash,
 		Salt:                     kekSalt,
@@ -169,22 +198,29 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 		RecoverySalt:             recoverySalt,
 		RecoveryWrappedMasterKey: recoveryWrappedMasterKey,
 		RecoveryMasterKeyNonce:   recoveryMasterKeyNonce,
+		KEKParams:                authsvc.FormatArgon2Params(h.params),
+		RecoveryKEKParams:        authsvc.FormatArgon2Params(h.params),
 		CreatedAt:                time.Now(),
 	}
 	if err := h.users.CreateUser(r.Context(), user); err != nil {
 		// Surface a conflict specifically so the caller can show a helpful message.
 		// All other errors are collapsed to 500 to avoid leaking internal details.
 		if errors.Is(err, authsvc.ErrDuplicateEmail) {
+			// Deliberate 409 (not a stealthy fake-201): register is rate-limited,
+			// and hiding duplicates here would break the standard client contract.
+			// The tradeoff is documented in README §Security Model (P1-4).
+			audit(r, "register_rejected_duplicate")
 			http.Error(w, "email already registered", http.StatusConflict)
 			return
 		}
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	audit(r, "register_success", "user_id", user.ID)
 
 	// Auto-login: issue access + refresh tokens so the client doesn't need a
 	// separate login round-trip after registration.
-	if err := h.issueSession(w, user.ID, masterKey); err != nil {
+	if err := h.issueSession(r, w, user.ID, masterKey); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -222,31 +258,50 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if user == nil {
+		audit(r, "login_failed", "email", req.Email, "reason", "unknown_user")
 		http.Error(w, "invalid credentials", http.StatusUnauthorized)
 		return
 	}
 
 	// Step 1: verify the raw password against the PHC-format hash.
 	if _, err := crypto.VerifyPassword(req.Password, user.PasswordHash); err != nil {
+		audit(r, "login_failed", "email", req.Email, "reason", "bad_password")
 		http.Error(w, "invalid credentials", http.StatusUnauthorized)
 		return
 	}
 
-	// Step 2: re-derive the KEK using the stored KEK salt.
-	kek := crypto.DeriveKEK(req.Password, user.Salt, h.params)
+	// Step 2: re-derive the KEK using the stored KEK salt AND the cost
+	// parameters captured when the wrap was created (never live config —
+	// see kekParamsFor).
+	kek := crypto.DeriveKEK(req.Password, user.Salt, kekParamsFor(user, h.params, "kek"))
 
 	// Step 3: unwrap the master key using the re-derived KEK.
-	masterKey, err := crypto.UnwrapDEK(user.WrappedMasterKey, user.MasterKeyNonce, kek)
+	masterKey, err := crypto.UnwrapDEKAny(user.WrappedMasterKey, user.MasterKeyNonce, kek, crypto.MasterKeyAAD(user.ID))
 	if err != nil {
+		audit(r, "login_failed", "user_id", user.ID, "reason", "unwrap_failed")
 		http.Error(w, "invalid credentials", http.StatusUnauthorized)
 		return
 	}
 
-	if err := h.issueSession(w, user.ID, masterKey); err != nil {
+	// Step 4: lazy KDF upgrade (ROADMAP P0-5). If the stored hash was made
+	// with materially weaker parameters than current config, transparently
+	// rehash and re-wrap now that we hold both password and master key.
+	// Failure must not break the login in progress — log and continue.
+	if need, err := crypto.NeedsRehash(user.PasswordHash, h.params); err == nil && need {
+		if uerr := h.upgradeKDFParameters(r.Context(), req.Password, user, masterKey); uerr != nil {
+			slog.Error("kdf upgrade failed", "user_id", user.ID, "error", uerr)
+			audit(r, "kdf_upgrade_failed", "user_id", user.ID)
+		} else {
+			audit(r, "kdf_upgrade_success", "user_id", user.ID)
+		}
+	}
+
+	if err := h.issueSession(r, w, user.ID, masterKey); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
+	audit(r, "login_success", "user_id", user.ID)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -267,6 +322,17 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 	// An unknown or expired token returns !ok — no error is logged because
 	// this can happen legitimately (e.g. server restart clearing in-memory sessions).
 	session, ok := h.sessions.Get(cookie.Value)
+	if !ok && h.refresh != nil {
+		// Durable lookup. A valid-but-keyless record still cannot mint an
+		// access session after a restart — the Master Key existed only in
+		// process memory. Fall through to the same generic 401 so an
+		// attacker probing stolen cookies learns nothing either way.
+		if rec, err := h.refresh.GetValid(r.Context(), cookie.Value); err == nil && rec != nil {
+			audit(r, "refresh_rejected_post_restart", "user_id", rec.UserID)
+		}
+		http.Error(w, "invalid or expired refresh token", http.StatusUnauthorized)
+		return
+	}
 	if !ok {
 		http.Error(w, "invalid or expired refresh token", http.StatusUnauthorized)
 		return
@@ -291,12 +357,20 @@ func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 	// Evict the access session by resolving the JWT's session_token claim.
 	if cookie, err := r.Cookie("access_token"); err == nil {
 		if claims, err := h.parseJWT(cookie.Value); err == nil {
+			if session, ok := h.sessions.Get(claims.SessionToken); ok {
+				audit(r, "logout", "user_id", session.UserID)
+			}
 			h.sessions.Delete(claims.SessionToken)
 		}
 	}
 	// Evict the refresh session — its cookie value is the session key directly.
 	if cookie, err := r.Cookie("refresh_token"); err == nil {
 		h.sessions.Delete(cookie.Value)
+		if h.refresh != nil {
+			if err := h.refresh.Revoke(r.Context(), cookie.Value); err != nil {
+				slog.Error("durable refresh revoke failed", "error", err)
+			}
+		}
 	}
 
 	// Always clear cookies regardless of whether session eviction succeeded.
@@ -319,7 +393,7 @@ func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 //
 // Neither cookie value encodes the KEK; the KEK lives exclusively in the
 // in-memory SessionStore and is never written to disk or sent over the wire.
-func (h *AuthHandler) issueSession(w http.ResponseWriter, userID string, kek []byte) error {
+func (h *AuthHandler) issueSession(r *http.Request, w http.ResponseWriter, userID string, kek []byte) error {
 	// Issue the short-lived access JWT first.
 	if err := h.issueAccessJWT(w, userID, kek); err != nil {
 		return err
@@ -335,6 +409,17 @@ func (h *AuthHandler) issueSession(w http.ResponseWriter, userID string, kek []b
 		KEK:       kek,
 		ExpiresAt: time.Now().Add(refreshTokenDuration),
 	})
+
+	// Durable twin: hash-only identity so logout revokes survive restarts.
+	// Best-effort — a failed write degrades to RAM-only semantics rather
+	// than failing an otherwise successful login.
+	expires := time.Now().Add(refreshTokenDuration)
+	if h.refresh != nil {
+		if err := h.refresh.Save(r.Context(), refreshToken, userID, expires); err != nil {
+			slog.Error("durable refresh save failed", "user_id", userID, "error", err)
+		}
+	}
+
 	setHttpOnlyCookie(w, "refresh_token", refreshToken, refreshTokenDuration)
 
 	return nil

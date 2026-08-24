@@ -4,6 +4,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/Kyei-Ernest/DocOps/connectors"
 	"github.com/Kyei-Ernest/DocOps/middleware"
@@ -64,6 +65,14 @@ func (d *DownloadHandler) Download(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 4b. TTL enforcement: an expired document is indistinguishable from a
+	//     nonexistent one — consistent with the 404-uniformity that hides
+	//     document existence from non-owners.
+	if doc.ExpiresAt != nil && time.Now().After(*doc.ExpiresAt) {
+		http.Error(w, "document not found", http.StatusNotFound)
+		return
+	}
+
 	// 6. Stream encrypted file from storage
 	dataStream, err := d.connector.Download(r.Context(), doc.StorageKey)
 	if err != nil {
@@ -72,8 +81,10 @@ func (d *DownloadHandler) Download(w http.ResponseWriter, r *http.Request) {
 	}
 	defer dataStream.Close()
 
-	// 7. Unwrap the per-document DEK
-	dek, err := crypto.UnwrapDEK(doc.EncryptedDEK, doc.DEKNonce, kek)
+	// 7. Unwrap the per-document DEK. Bound wraps require the exact
+	//    (userID, docID) context they were sealed under; legacy unbound rows
+	//    still open via the fallback inside UnwrapDEKAny.
+	dek, err := crypto.UnwrapDEKAny(doc.EncryptedDEK, doc.DEKNonce, kek, crypto.DEKAAD(userID, docID))
 	if err != nil {
 		http.Error(w, "failed to unwrap key", http.StatusInternalServerError)
 		return

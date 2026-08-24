@@ -56,6 +56,13 @@ func Load(path string) (*models.Config, error) {
 		RateLimit: models.RateLimitConfig{
 			Limit:  5,
 			Window: "1m",
+			// Spoofable headers are ignored unless explicitly opted into —
+			// see models.RateLimitConfig.TrustProxyHeaders.
+			TrustProxyHeaders: false,
+			Documents: models.RateLimitSubConfig{
+				Limit:  120, // machine-friendly default for document routes
+				Window: "1m",
+			},
 		},
 	}
 
@@ -140,17 +147,21 @@ func Parse(raw *models.Config) (*ParsedConfig, error) {
 // secrets are pulled from the environment rather than the config file so they
 // are never accidentally committed to version control.
 type ParsedConfig struct {
-	Port            int
-	ReadTimeout     time.Duration
-	WriteTimeout    time.Duration
-	AccessTokenTTL  time.Duration
-	RefreshTokenTTL time.Duration
-	JWTSecret       []byte // loaded from JWT_SECRET env var — never from the YAML file
-	StoragePath     string
-	DatabasePath    string
-	Argon2          models.Argon2Config
-	RateLimitLimit  int
-	RateLimitWindow time.Duration
+	Port                int
+	ReadTimeout         time.Duration
+	WriteTimeout        time.Duration
+	AccessTokenTTL      time.Duration
+	RefreshTokenTTL     time.Duration
+	JWTSecret           []byte // loaded from JWT_SECRET env var — never from the YAML file
+	StoragePath         string
+	DatabasePath        string
+	Argon2              models.Argon2Config
+	RateLimitLimit      int
+	RateLimitWindow     time.Duration
+	RateLimitTrustProxy bool
+
+	DocsRateLimitLimit  int
+	DocsRateLimitWindow time.Duration
 }
 
 // Parse converts the raw string values in the config into typed Go values
@@ -204,17 +215,33 @@ func (c *config) Parse() (*ParsedConfig, error) {
 		return nil, fmt.Errorf("invalid rate_limit window %q: %w", c.RateLimit.Window, err)
 	}
 
+	docsWindow := limitWindow
+	if c.RateLimit.Documents.Window != "" {
+		docsWindow, err = time.ParseDuration(c.RateLimit.Documents.Window)
+		if err != nil {
+			return nil, fmt.Errorf("invalid rate_limit.documents window %q: %w", c.RateLimit.Documents.Window, err)
+		}
+	}
+	docsLimit := c.RateLimit.Documents.Limit
+	if docsLimit == 0 {
+		docsLimit = c.RateLimit.Limit // zero → inherit the auth ceiling
+	}
+
 	return &ParsedConfig{
-		Port:            c.Server.Port,
-		ReadTimeout:     readTimeout,
-		WriteTimeout:    writeTimeout,
-		AccessTokenTTL:  accessTTL,
-		RefreshTokenTTL: refreshTTL,
-		JWTSecret:       []byte(jwtSecret), // converted to []byte for direct use with JWT signing
-		StoragePath:     c.Storage.Local.Path,
-		DatabasePath:    c.Database.Path,
-		Argon2:          c.Argon2,
-		RateLimitLimit:  c.RateLimit.Limit,
-		RateLimitWindow: limitWindow,
+		Port:                c.Server.Port,
+		ReadTimeout:         readTimeout,
+		WriteTimeout:        writeTimeout,
+		AccessTokenTTL:      accessTTL,
+		RefreshTokenTTL:     refreshTTL,
+		JWTSecret:           []byte(jwtSecret), // converted to []byte for direct use with JWT signing
+		StoragePath:         c.Storage.Local.Path,
+		DatabasePath:        c.Database.Path,
+		Argon2:              c.Argon2,
+		RateLimitLimit:      c.RateLimit.Limit,
+		RateLimitWindow:     limitWindow,
+		RateLimitTrustProxy: c.RateLimit.TrustProxyHeaders,
+
+		DocsRateLimitLimit:  docsLimit,
+		DocsRateLimitWindow: docsWindow,
 	}, nil
 }

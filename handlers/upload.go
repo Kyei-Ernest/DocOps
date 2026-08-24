@@ -125,9 +125,11 @@ func (h *UploadHandler) Upload(w http.ResponseWriter, r *http.Request) {
 
 	// ── Step 6: Encrypt the DEK with the KEK ─────────────────────
 	// This is envelope encryption — the DEK is wrapped by the KEK.
-	// We store the encrypted DEK in the DB, never the plaintext DEK.
-	// The plaintext DEK exists only in memory during this request.
-	encryptedDEK, dekNonce, err := crypto.WrapDEK(dek, kek)
+	// The wrap is AAD-bound to (userID, docID): a wrapped DEK copied into a
+	// different row fails GCM authentication instead of decrypting happily
+	// (ROADMAP P0-4). The document ID is therefore minted before the wrap.
+	docID := "doc_" + uuid.NewString()
+	encryptedDEK, dekNonce, err := crypto.WrapDEKBound(dek, kek, crypto.DEKAAD(userID, docID))
 	if err != nil {
 		http.Error(w, "failed to encrypt document key", http.StatusInternalServerError)
 		return
@@ -160,7 +162,7 @@ func (h *UploadHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	// This is the only thing that permanently lives on DocOps servers.
 	// The file itself lives at the storage provider (local for now).
 	doc := &models.Document{
-		ID:            "doc_" + uuid.NewString(), // unique document ID
+		ID:            docID, // unique document ID (minted pre-wrap for AAD binding)
 		Name:          header.Filename,
 		FileType:      header.Header.Get("Content-Type"),
 		Provider:      "local",

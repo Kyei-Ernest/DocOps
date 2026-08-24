@@ -2,10 +2,14 @@ package handlers
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"net/http"
 
 	"github.com/Kyei-Ernest/DocOps/middleware"
+	authsvc "github.com/Kyei-Ernest/DocOps/services/auth"
 	"github.com/Kyei-Ernest/DocOps/services/crypto"
 )
 
@@ -43,17 +47,19 @@ func (h *AuthHandler) Recover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if user == nil {
-		// Avoid user enumeration: return same generic status
+		audit(r, "recover_failed", "email", req.Email, "reason", "unknown_user")
 		http.Error(w, "invalid credentials or recovery key", http.StatusUnauthorized)
 		return
 	}
 
-	// 1. Derive recovery KEK from recovery key
-	recoveryKEK := crypto.DeriveKEK(req.RecoveryKey, user.RecoverySalt, h.params)
+	// 1. Derive recovery KEK from recovery key using the parameters captured
+	//    at wrap time — live config may have moved on since registration.
+	recoveryKEK := crypto.DeriveKEK(req.RecoveryKey, user.RecoverySalt, kekParamsFor(user, h.params, "recovery"))
 
 	// 2. Decrypt (unwrap) the Master Key using the recovery KEK
-	masterKey, err := crypto.UnwrapDEK(user.RecoveryWrappedMasterKey, user.RecoveryMasterKeyNonce, recoveryKEK)
+	masterKey, err := crypto.UnwrapDEKAny(user.RecoveryWrappedMasterKey, user.RecoveryMasterKeyNonce, recoveryKEK, crypto.RecoveryKeyAAD(user.ID))
 	if err != nil {
+		audit(r, "recover_failed", "user_id", user.ID, "reason", "unwrap_failed")
 		http.Error(w, "invalid credentials or recovery key", http.StatusUnauthorized)
 		return
 	}
@@ -70,7 +76,7 @@ func (h *AuthHandler) Recover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	newKEK := crypto.DeriveKEK(req.NewPassword, newSalt, h.params)
-	newWrappedMasterKey, newMasterKeyNonce, err := crypto.WrapDEK(masterKey, newKEK)
+	newWrappedMasterKey, newMasterKeyNonce, err := crypto.WrapDEKBound(masterKey, newKEK, crypto.MasterKeyAAD(user.ID))
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -81,12 +87,14 @@ func (h *AuthHandler) Recover(w http.ResponseWriter, r *http.Request) {
 	user.Salt = newSalt
 	user.WrappedMasterKey = newWrappedMasterKey
 	user.MasterKeyNonce = newMasterKeyNonce
+	user.KEKParams = authsvc.FormatArgon2Params(h.params) // fresh wrap under current config
 
 	if err := h.users.UpdateUserKeys(r.Context(), user); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
+	audit(r, "recover_success", "user_id", user.ID)
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{
 		"message": "Password recovered successfully",
@@ -130,6 +138,7 @@ func (h *AuthHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
 
 	// Verify old password
 	if _, err := crypto.VerifyPassword(req.OldPassword, user.PasswordHash); err != nil {
+		audit(r, "change_password_failed", "user_id", userID, "reason", "bad_old_password")
 		http.Error(w, "invalid credentials", http.StatusUnauthorized)
 		return
 	}
@@ -146,7 +155,7 @@ func (h *AuthHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	newKEK := crypto.DeriveKEK(req.NewPassword, newSalt, h.params)
-	newWrappedMasterKey, newMasterKeyNonce, err := crypto.WrapDEK(masterKey, newKEK)
+	newWrappedMasterKey, newMasterKeyNonce, err := crypto.WrapDEKBound(masterKey, newKEK, crypto.MasterKeyAAD(user.ID))
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -157,12 +166,14 @@ func (h *AuthHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
 	user.Salt = newSalt
 	user.WrappedMasterKey = newWrappedMasterKey
 	user.MasterKeyNonce = newMasterKeyNonce
+	user.KEKParams = authsvc.FormatArgon2Params(h.params) // fresh wrap under current config
 
 	if err := h.users.UpdateUserKeys(r.Context(), user); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
+	audit(r, "change_password_success", "user_id", userID)
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{
 		"message": "Password changed successfully",
@@ -205,6 +216,7 @@ func (h *AuthHandler) RotateMasterKey(w http.ResponseWriter, r *http.Request) {
 
 	// Verify password to ensure we can derive KEK to re-wrap new master key
 	if _, err := crypto.VerifyPassword(req.Password, user.PasswordHash); err != nil {
+		audit(r, "rotate_master_key_failed", "user_id", userID, "reason", "bad_password")
 		http.Error(w, "invalid credentials", http.StatusUnauthorized)
 		return
 	}
@@ -216,42 +228,15 @@ func (h *AuthHandler) RotateMasterKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Fetch all documents for this user
-	docs, err := h.metaStore.ListAllForUser(r.Context(), userID)
-	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-
-	// 3. For each document: unwrap DEK with old master key, wrap with new master key
-	for _, doc := range docs {
-		if doc.EncryptedDEK != nil {
-			dek, err := crypto.UnwrapDEK(doc.EncryptedDEK, doc.DEKNonce, oldMasterKey)
-			if err != nil {
-				http.Error(w, "failed to decrypt document key during rotation", http.StatusInternalServerError)
-				return
-			}
-			newEncryptedDEK, newDEKNonce, err := crypto.WrapDEK(dek, newMasterKey)
-			if err != nil {
-				http.Error(w, "failed to encrypt document key during rotation", http.StatusInternalServerError)
-				return
-			}
-			if err := h.metaStore.UpdateDEK(r.Context(), doc.ID, userID, newEncryptedDEK, newDEKNonce); err != nil {
-				http.Error(w, "failed to update document key during rotation", http.StatusInternalServerError)
-				return
-			}
-		}
-	}
-
-	// 4. Wrap new Master Key with password KEK
+	// 2. Pre-compute every wrap that does not depend on document rows —
+	//    all pure crypto, so a failure here aborts before any DB write.
 	kek := crypto.DeriveKEK(req.Password, user.Salt, h.params)
-	newWrappedMasterKey, newMasterKeyNonce, err := crypto.WrapDEK(newMasterKey, kek)
+	newWrappedMasterKey, newMasterKeyNonce, err := crypto.WrapDEKBound(newMasterKey, kek, crypto.MasterKeyAAD(userID))
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
-	// 5. Generate new Recovery Key, derive KEK_recovery, and wrap new Master Key
 	newRecoveryKey, err := generateRecoveryKey()
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -263,25 +248,58 @@ func (h *AuthHandler) RotateMasterKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	newRecoveryKEK := crypto.DeriveKEK(newRecoveryKey, newRecoverySalt, h.params)
-	newRecoveryWrappedMasterKey, newRecoveryMasterKeyNonce, err := crypto.WrapDEK(newMasterKey, newRecoveryKEK)
+	newRecoveryWrappedMasterKey, newRecoveryMasterKeyNonce, err := crypto.WrapDEKBound(newMasterKey, newRecoveryKEK, crypto.RecoveryKeyAAD(userID))
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
-	// 6. Update user record
 	user.WrappedMasterKey = newWrappedMasterKey
 	user.MasterKeyNonce = newMasterKeyNonce
 	user.RecoverySalt = newRecoverySalt
 	user.RecoveryWrappedMasterKey = newRecoveryWrappedMasterKey
 	user.RecoveryMasterKeyNonce = newRecoveryMasterKeyNonce
+	user.KEKParams = authsvc.FormatArgon2Params(h.params)
+	user.RecoveryKEKParams = authsvc.FormatArgon2Params(h.params)
 
-	if err := h.users.UpdateUserKeys(r.Context(), user); err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+	// 3. Atomic rotation: re-wrap EVERY document DEK and update the user key
+	//    row inside ONE transaction. The old Master Key remains fully valid
+	//    until commit, so concurrent downloads observe only the old or the
+	//    new consistent state — never a half-rotated mix (ROADMAP P0-2).
+	err = h.metaStore.InTx(r.Context(), func(tx *sql.Tx) error {
+		docs, err := h.metaStore.ListAllForUserTx(r.Context(), tx, userID)
+		if err != nil {
+			return err
+		}
+		for _, doc := range docs {
+			if doc.EncryptedDEK == nil {
+				continue
+			}
+			dek, err := crypto.UnwrapDEKAny(doc.EncryptedDEK, doc.DEKNonce, oldMasterKey, crypto.DEKAAD(userID, doc.ID))
+			if err != nil {
+				return fmt.Errorf("unwrap DEK for doc %s: %w", doc.ID, err)
+			}
+			// Fresh wraps are always AAD-bound — rotation doubles as the
+			// migration path that upgrades legacy unbound rows (ROADMAP P0-4).
+			newEncryptedDEK, newDEKNonce, err := crypto.WrapDEKBound(dek, newMasterKey, crypto.DEKAAD(userID, doc.ID))
+			if err != nil {
+				return fmt.Errorf("wrap DEK for doc %s: %w", doc.ID, err)
+			}
+			if err := h.metaStore.UpdateDEKTx(r.Context(), tx, doc.ID, userID, newEncryptedDEK, newDEKNonce); err != nil {
+				return fmt.Errorf("persist DEK for doc %s: %w", doc.ID, err)
+			}
+		}
+		return h.users.UpdateUserKeysTx(r.Context(), tx, user)
+	})
+	if err != nil {
+		// Rolled back wholesale: old wraps + old user keys remain authoritative.
+		audit(r, "rotate_master_key_failed", "user_id", userID, "reason", "tx_aborted")
+		slog.Error("master key rotation rolled back", "user_id", userID, "error", err)
+		http.Error(w, "rotation failed; no changes were made", http.StatusInternalServerError)
 		return
 	}
 
-	// 7. Update current session in RAM to use the new master key!
+	// 4. Update current session in RAM to use the new master key!
 	if cookie, err := r.Cookie("access_token"); err == nil {
 		if claims, err := h.parseJWT(cookie.Value); err == nil {
 			if session, ok := h.sessions.Get(claims.SessionToken); ok {
@@ -299,6 +317,7 @@ func (h *AuthHandler) RotateMasterKey(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
+	audit(r, "rotate_master_key_success", "user_id", userID)
 	json.NewEncoder(w).Encode(map[string]string{
 		"recovery_key": newRecoveryKey,
 		"message":      "Master Key rotated successfully. Please store your new recovery key.",

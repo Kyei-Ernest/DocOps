@@ -505,3 +505,69 @@ func TestStreamFullFlow_UploadDownload(t *testing.T) {
 		t.Fatalf("file content mismatch: expected %q got %q", fileContent, recoveredFile)
 	}
 }
+
+// ── AAD binding (ROADMAP P0-4) ──────────────────────────────────────────────
+
+func TestWrapDEKBound_RoundTrip(t *testing.T) {
+	dek, _ := GenerateDEK()
+	kek, _ := GenerateDEK()
+	aad := DEKAAD("user-1", "doc-1")
+
+	wrapped, nonce, err := WrapDEKBound(dek, kek, aad)
+	if err != nil {
+		t.Fatalf("wrap: %v", err)
+	}
+
+	got, err := UnwrapDEKBound(wrapped, nonce, kek, aad)
+	if err != nil {
+		t.Fatalf("unwrap: %v", err)
+	}
+	if !bytes.Equal(got, dek) {
+		t.Fatal("round-trip mismatch")
+	}
+}
+
+func TestWrapDEKBound_WrongAADFails(t *testing.T) {
+	dek, _ := GenerateDEK()
+	kek, _ := GenerateDEK()
+
+	wrapped, nonce, err := WrapDEKBound(dek, kek, DEKAAD("user-1", "doc-1"))
+	if err != nil {
+		t.Fatalf("wrap: %v", err)
+	}
+
+	if _, err := UnwrapDEKBound(wrapped, nonce, kek, DEKAAD("user-1", "doc-2")); err == nil {
+		t.Fatal("opening under a different docID AAD must fail")
+	}
+	if _, err := UnwrapDEKBound(wrapped, nonce, kek, DEKAAD("user-2", "doc-1")); err == nil {
+		t.Fatal("opening under a different userID AAD must fail")
+	}
+	if _, err := UnwrapDEKBound(wrapped, nonce, kek, nil); err == nil {
+		t.Fatal("opening bound blob without AAD must fail")
+	}
+}
+
+func TestUnwrapDEKAny_LegacyFallback(t *testing.T) {
+	dek, _ := GenerateDEK()
+	kek, _ := GenerateDEK()
+
+	// Legacy unbound wrap.
+	wrapped, nonce, err := WrapDEK(dek, kek)
+	if err != nil {
+		t.Fatalf("legacy wrap: %v", err)
+	}
+
+	got, err := UnwrapDEKAny(wrapped, nonce, kek, DEKAAD("user-1", "doc-1"))
+	if err != nil {
+		t.Fatalf("legacy fallback failed: %v", err)
+	}
+	if !bytes.Equal(got, dek) {
+		t.Fatal("legacy fallback round-trip mismatch")
+	}
+
+	// Wrong key must still fail through the Any path.
+	otherKey, _ := GenerateDEK()
+	if _, err := UnwrapDEKAny(wrapped, nonce, otherKey, DEKAAD("user-1", "doc-1")); err == nil {
+		t.Fatal("wrong key opened legacy blob via Any path")
+	}
+}

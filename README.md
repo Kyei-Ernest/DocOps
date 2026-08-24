@@ -1,10 +1,11 @@
 <p align="center">
   <h1 align="center">🔐 DocOps</h1>
   <p align="center">
-    <strong>Self-hostable encrypted document storage API</strong>
+    <strong>The encrypted document backend your application can actually search.</strong>
   </p>
   <p align="center">
-    Encrypt, upload, and search documents through a single API — backed by your own storage provider.
+    Store, search, and stream documents over a plain HTTP API — while remaining provably unable to read any of them at rest.
+    Self-hosted. One container. Your storage.
   </p>
   <p align="center">
     <a href="#quickstart"><strong>Quickstart</strong></a> ·
@@ -20,7 +21,7 @@
 <p align="center">
   <img alt="Go Version" src="https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat-square&logo=go&logoColor=white" />
   <img alt="License" src="https://img.shields.io/badge/License-MIT-blue?style=flat-square" />
-  <img alt="Tests" src="https://img.shields.io/badge/Tests-140_passing-brightgreen?style=flat-square" />
+  <img alt="Tests" src="https://img.shields.io/badge/Tests-171_passing_battle_tested-brightgreen?style=flat-square" />
   <img alt="Status" src="https://img.shields.io/badge/Status-Alpha-orange?style=flat-square" />
 </p>
 
@@ -28,15 +29,50 @@
 
 ## Why DocOps?
 
-Most document storage solutions force you to trust a third party with your plaintext files. DocOps takes a different approach: **your files are encrypted before they ever leave the server**, using keys derived from your password that are never persisted to disk.
+Every option for handling sensitive documents forces a tradeoff:
 
-- **Zero-knowledge encryption** — files are encrypted with per-document keys; the server never stores your master key
-- **Bring your own storage** — local disk today, S3/GCS/Google Drive on the roadmap
-- **Full-text search** — search across document names, tags, and extracted text via SQLite FTS5
-- **Multi-tenant by default** — every query is scoped by user; document isolation is enforced at the database layer
+| | Content private at rest? | Searchable? | Scriptable API? |
+|:---|:---:|:---:|:---:|
+| S3 / Google Drive (+ SSE) | ❌ *the provider holds the keys* | ✅ | ✅ |
+| Cryptomator / VeraCrypt | ✅ | ❌ opaque blobs | ❌ |
+| Nextcloud E2E encryption | ✅ | ❌ deliberately broken by E2E | ⚠️ |
+| Roll it yourself (Tink, libsodium) | ⚠️ nonce-reuse bugs are career-shortening | ✅ | ✅ |
+| **DocOps** | ✅ | ✅ FTS5 | ✅ REST + bearer keys |
+
+**A database dump is not a breach.** Compromise DocOps' entire SQLite file and you walk away with salts and wrapped key blobs only — the Master Key exists solely in process RAM during active sessions, API-key secrets are stored as SHA-256, refresh tokens are hash-only, and every wrapped key is AAD-bound so even malicious database *writes* can't swap key material between rows undetected.
+
+**It's boring infrastructure on purpose.** One container, one DB file, bring-your-own disk, MIT licensed. Humans authenticate with cookie sessions; machines use `docops_sk_…` bearer keys that work statelessly across restarts and revoke fail-closed in one call.
+
+> [!IMPORTANT]
+> **Honest scope:** document *content* is zero-knowledge; *metadata* (names, tags,
+> extracted text) is stored in plaintext to power search. If you need E2E-encrypted
+> metadata too, this isn't your tool — and we'd rather say so than oversell.
+
+<details>
+<summary><strong>The 60-second proof</strong> — run these four commands against any competitor's "encrypted storage"</summary>
+
+```bash
+# 1. Register and mint a machine credential
+curl -X POST :8080/v0.1/auth/register -d '{"email":"a@b.c","password":"hunter2xx"}' -c c.txt
+curl -X POST :8080/v0.1/auth/api-keys -b c.txt -d '{"name":"ci"}'
+
+# 2. Upload a secret using the bearer key
+curl -H "Authorization: Bearer docops_sk_…" -F file=@secret.pdf :8080/v0.1/docs/upload
+
+# 3. Search finds it…
+curl ":8080/v0.1/docs/search?q=secret" -b c.txt
+
+# 4. …but the database has never seen plaintext:
+sqlite3 docops.db "SELECT hex(encrypted_dek) FROM documents LIMIT 1"
+strings docops.db | grep -i secret   # → no match
+```
+
+</details>
 
 > [!NOTE]
-> DocOps is in **active development (alpha)**. The core encryption, auth, upload/download, and storage layers are built and tested. Cloud connectors and text extraction are coming next.
+> DocOps is in **active development (alpha)** — P0 hardening (atomic rotation, AAD
+> binding, lazy KDF upgrades, API keys) is complete and battle-tested. Next up:
+> cloud connectors, text extraction, OpenAPI/SDKs. See [ROADMAP.md](ROADMAP.md).
 
 ---
 
@@ -45,19 +81,25 @@ Most document storage solutions force you to trust a third party with your plain
 | Feature | Status | Description |
 |:---|:---:|:---|
 | 🔑 Envelope encryption | ✅ | Per-document AES-256-GCM keys, wrapped by a user-derived KEK |
-| 🔒 Argon2id auth | ✅ | Password hashing + KEK derivation with independent salts |
-| 🍪 JWT sessions | ✅ | HttpOnly/Secure cookies with access (15m) + refresh (7d) tokens |
+| 🔒 Argon2id auth | ✅ | Independent salts + per-user persisted KDF params |
+| 📈 Lazy KDF upgrade | ✅ | Strengthen config → users transparently rehash-and-rewrap at next login |
+| 🔗 AAD-bound key wraps | ✅ | Swapped wrapped keys fail authentication (swap-attack tested) |
+| ♻️ Atomic key rotation | ✅ | Master Key rotation commits all DEK re-wraps in one transaction; crash-safe |
+| 🤖 API keys (`docops_sk_…`) | ✅ | Stateless bearer auth for machines — HKDF wrap tier, shown once, SHA-256 at rest, instant revocation |
+| 🍪 JWT sessions | ✅ | HttpOnly/Secure/SameSite=Strict cookies, access (15m) + refresh (7d), revocable server-side |
+| 💓 Durable refresh tokens | ✅ | Hash-only records — revocation & audit survive restarts, zero key material at rest |
 | 🔍 Full-text search | ✅ | SQLite FTS5 with trigger-synced index |
-| 📤 File upload | ✅ | Multipart upload with chunked streaming encryption (64 KB) |
+| 📤 File upload | ✅ | Multipart upload with chunked streaming encryption (64 KB, constant memory) |
 | 📥 File download | ✅ | DEK unwrap + chunked streaming decryption to client |
+| ⏳ TTL enforcement | ✅ | Expired documents 404 like nonexistent ones + storage sweeper |
+| 🏥 Health probes | ✅ | `/healthz` liveness, `/readyz` dependency-gated readiness |
+| 🧾 Audit logging | ✅ | Structured security events — identifiers only, never secrets |
+| 🛡️ Rate limiting | ✅ | IP fixed-window, trust-gated proxy headers, separate document-route ceiling |
+| 👥 Multi-tenant | ✅ | All operations scoped by `user_id` in SQL |
 | 💾 Local storage | ✅ | Filesystem connector with streaming I/O |
-| ⚙️ YAML config | ✅ | Sensible defaults, `.env` for secrets |
-| 🛡️ Auth middleware | ✅ | JWT → session → KEK resolution per request |
-| 👥 Multi-tenant | ✅ | All operations scoped by `user_id` |
-| 🗑️ File deletion | ✅ | Secure delete from both storage connector and metadata DB |
-| 🛡️ Rate limiting | ✅ | IP-based sliding-window rate limiting on sensitive endpoints |
-| ☁️ Cloud connectors | 🚧 | S3, GCS, Google Drive |
+| ☁️ Cloud connectors | 🚧 | S3-compatible first (covers R2/MinIO/Spaces) |
 | 📝 Text extraction | 🚧 | PDF/DOCX content extraction for search indexing |
+| 📖 OpenAPI + SDKs | 🚧 | Spec-first generated clients |
 
 ---
 
@@ -207,8 +249,26 @@ graph TD
 | **Nonce reuse** | Each encryption call generates a fresh random nonce |
 | **Password hash vs KEK** | Independent Argon2id derivations with separate salts |
 | **JWT contents** | Opaque session token only — no key material in the token |
-| **Session revocation** | Server-side session store; logout invalidates immediately |
-| **Timing attacks** | Constant-time comparison for password verification |
+| **Session revocation** | Server-side session store; logout invalidates immediately; refresh-token revocation survives restarts (hash-only durable records) |
+| **Timing attacks** | Constant-time comparison for password verification and API-key secrets |
+| **Key-wrap binding (AAD)** | Every wrapped key is cryptographically bound to its owner/document — swapped wraps fail authentication |
+| **Rotation atomicity** | Master Key rotation commits all DEK re-wraps in one transaction; crash leaves the old state intact |
+| **API keys** | Secret shown once, stored as SHA-256 only; stateless bearer auth; instant fail-closed revocation |
+
+### Deliberate Tradeoffs
+
+- **Register returns `409 Conflict` for duplicate emails.** This reveals that an email
+  is registered to careful probing — accepted deliberately because registration is IP
+  rate-limited and a stealthy fake-success would break the standard client contract
+  (users would believe an account exists when it doesn't, or vice versa). Login remains
+  fully enumeration-resistant (identical 401 for unknown user and wrong password).
+- **Metadata is not encrypted.** Document names, tags, sizes, timestamps, and extracted
+  text are stored in plaintext to power FTS5 search. *Content* is zero-knowledge;
+  metadata is not.
+- **Rate limiting trusts `RemoteAddr` by default.** `X-Forwarded-For` is honored only
+  when `rate_limit.trust_proxy_headers: true` is set — enable it solely behind a proxy
+  that overwrites those headers.
+
 
 ### Chunked Streaming Protocol
 
@@ -323,6 +383,35 @@ make local_connector_test        #  7 tests — filesystem upload, download, del
 | `POST` | `/v0.1/auth/recover` | Recover password using offline Recovery Key |
 | `POST` | `/v0.1/auth/change-password` | Change password for authenticated users (protected) |
 | `POST` | `/v0.1/auth/rotate-master-key` | Rotates the user's Master Key and re-encrypts all document keys (protected) |
+| `POST` | `/v0.1/auth/api-keys` | Create machine credential — secret shown exactly once (protected) |
+| `GET`  | `/v0.1/auth/api-keys` | List your API keys (metadata only) (protected) |
+| `DELETE` | `/v0.1/auth/api-keys/{keyID}` | Revoke an API key (protected) |
+
+#### API Keys
+
+API keys authenticate **machines** (CI jobs, server-to-server integrations) without
+passwords or sessions. Format: `docops_sk_<key_id>_<secret>`. The secret is a
+32-byte CSPRNG value shown exactly once at creation and stored only as a SHA-256
+hash; each key wraps your Master Key under its own HKDF-derived wrap key, so using
+a key grants full document access for your account until revoked.
+
+Because bearer authentication is **stateless**, machine traffic keeps working across
+server restarts while human sessions still require re-login.
+
+```bash
+# Create a key (requires an authenticated cookie session)
+curl -X POST http://localhost:8080/v0.1/auth/api-keys \
+  -b cookies.txt -H 'Content-Type: application/json' \
+  -d '{"name": "ci-bot"}'
+# → {"api_key":"docops_sk_…","key_id":"…"}   ← store this now; it is never shown again
+
+# Use it on any document route
+curl -H "Authorization: Bearer docops_sk_…" \
+  -F "file=@report.pdf" http://localhost:8080/v0.1/docs/upload
+
+# Revoke — takes effect immediately, fail-closed
+curl -X DELETE http://localhost:8080/v0.1/auth/api-keys/<key_id> -b cookies.txt
+```
 
 ### Documents
 
@@ -441,7 +530,20 @@ argon2:
   parallelism: 2
   key_length:  32      # 256-bit keys
   salt_length: 16      # 128-bit salts
+
+rate_limit:
+  limit:  5            # auth endpoints, per IP per window
+  window: "1m"
+  trust_proxy_headers: false  # true ONLY behind a header-sanitizing proxy
+  documents:           # document routes — machine-friendly ceiling
+    limit:  120
+    window: "1m"
 ```
+
+> **Note on Argon2 upgrades:** strengthening `argon2:` above transparently upgrades
+> existing users at their next login (rehash + key re-wrap). Each user's wrap is tied
+> to the parameters captured at creation (`kek_params`), so weakening config never
+> silently breaks existing accounts.
 
 ### Environment Variables
 
@@ -519,11 +621,20 @@ DocOps/
 - [x] Secure file deletion (both connector and database layers)
 - [x] Rate limiting middleware (IP-based sliding-window)
 - [x] Docker image and Compose file
+- [x] Structured logging (slog) + security audit events
+- [x] API-key authentication (`docops_sk_…` bearer keys, stateless, revocable)
+- [x] Atomic Master Key rotation (single transaction across all DEK re-wraps)
+- [x] AAD-bound key wraps (swapped wrapped DEKs fail authentication)
+- [x] Lazy Argon2id upgrade-on-login (per-user persisted KDF params)
+- [x] Health/readiness probes (`/healthz`, `/readyz`)
+- [x] Document expiry/TTL enforcement (download gate + storage sweeper)
+- [x] Graceful shutdown (connection draining)
 - [ ] Cloud storage connectors (S3, GCS, Google Drive)
 - [ ] Text extraction (PDF, DOCX) for search indexing
-- [ ] Document expiry and TTL enforcement
-- [x] Structured logging (slog)
-- [ ] OpenAPI specification
+- [ ] OpenAPI specification + generated SDKs
+- [ ] Organizations & sharing model
+
+Priorities and acceptance criteria: [`ROADMAP.md`](ROADMAP.md).
 
 ---
 

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/Kyei-Ernest/DocOps/config"
 	"github.com/Kyei-Ernest/DocOps/connectors/local"
@@ -62,8 +64,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Metadata store — document CRUD + FTS5 search (runs its own migrations)
-	metaStore, err := metadata.New(cfg.DatabasePath)
+	// Metadata store — document CRUD + FTS5 search (runs its own migrations).
+	// Built over the SAME *sql.DB pool as the user store so a single
+	// transaction can span documents + users tables (atomic key rotation).
+	metaStore, err := metadata.NewDB(db)
 	if err != nil {
 		slog.Error("failed to initialise metadata store", "error", err)
 		os.Exit(1)
@@ -81,6 +85,21 @@ func main() {
 	sessionStore := authsvc.NewSessionStore()
 	defer sessionStore.Close()
 
+	// API key store — stateless machine credentials (ROADMAP P0-1)
+	apiKeyStore, err := authsvc.NewAPIKeyStore(db)
+	if err != nil {
+		slog.Error("failed to initialise api key store", "error", err)
+		os.Exit(1)
+	}
+
+	// Refresh token store — hash-only durable identities for remember-me
+	// revocation/audit across restarts (ROADMAP P1-2)
+	refreshStore, err := authsvc.NewRefreshTokenStore(db)
+	if err != nil {
+		slog.Error("failed to initialise refresh token store", "error", err)
+		os.Exit(1)
+	}
+
 	// Local storage connector — filesystem-backed file I/O
 	connector, err := local.New(cfg.StoragePath)
 	if err != nil {
@@ -95,18 +114,33 @@ func main() {
 	}
 
 	// ── 4. Construct handlers ────────────────────────────────────
-	authHandler := handlers.NewAuthHandler(userStore, sessionStore, metaStore, &cfg.Argon2, cfg.JWTSecret)
+	authHandler := handlers.NewAuthHandlerWithRefresh(userStore, sessionStore, metaStore, refreshStore, &cfg.Argon2, cfg.JWTSecret)
 	uploadHandler := handlers.NewUploadHandler(connector, metaStore)
 	downloadHandler := handlers.NewDownloadHandler(connector, metaStore)
 	searchHandler := handlers.NewSearchHandler(connector, metaStore)
 	deleteHandler := handlers.NewDeleteHandler(connector, metaStore)
+	healthHandler := handlers.NewHealthHandler(db, connector)
+	apiKeyHandler := handlers.NewAPIKeyHandler(apiKeyStore)
 
 	// ── 5. Build router ──────────────────────────────────────────
 	r := chi.NewRouter()
 
-	// Create an IP-based rate limiter for auth endpoints
-	authLimiter := middleware.NewRateLimiter(cfg.RateLimitLimit, cfg.RateLimitWindow)
+	// Ops probes — unauthenticated by design: orchestrators must be able to
+	// determine liveness/readiness without holding credentials. /readyz
+	// reports component status without leaking internal error detail.
+	r.Get("/healthz", healthHandler.Live)
+	r.Get("/readyz", healthHandler.Ready)
+
+	// Create an IP-based rate limiter for auth endpoints. Proxy headers are
+	// honored only when explicitly configured (trust_proxy_headers) — see
+	// models.RateLimitConfig for the spoofing rationale.
+	authLimiter := middleware.NewRateLimiterWithTrust(cfg.RateLimitLimit, cfg.RateLimitWindow, cfg.RateLimitTrustProxy)
 	defer authLimiter.Close()
+
+	// Document routes get their own, higher ceiling — bearer-driven machine
+	// traffic is the primary consumer and must not trip the auth-tier limit.
+	docsLimiter := middleware.NewRateLimiterWithTrust(cfg.DocsRateLimitLimit, cfg.DocsRateLimitWindow, cfg.RateLimitTrustProxy)
+	defer docsLimiter.Close()
 
 	// Auth routes — rate limited using config values
 	r.Route("/v0.1/auth", func(r chi.Router) {
@@ -120,21 +154,67 @@ func main() {
 		})
 
 		r.Group(func(r chi.Router) {
-			r.Use(middleware.Auth(sessionStore, cfg.JWTSecret))
+			r.Use(middleware.AuthWithAPIKeys(sessionStore, cfg.JWTSecret, apiKeyStore))
 			r.Post("/change-password", authHandler.ChangePassword)
 			r.Post("/rotate-master-key", authHandler.RotateMasterKey)
+
+			// Machine credential lifecycle (P0-1). Creating requires a live
+			// session/bearer context to wrap the current Master Key.
+			r.Post("/api-keys", apiKeyHandler.Create)
+			r.Get("/api-keys", apiKeyHandler.List)
+			r.Delete("/api-keys/{keyID}", apiKeyHandler.Revoke)
 		})
 	})
 
-	// Document routes — all protected by auth middleware
+	// Document routes — protected by combined middleware: humans via cookie
+	// sessions, machines via Bearer docops_sk_… keys (stateless per request).
 	r.Route("/v0.1/docs", func(r chi.Router) {
-		r.Use(middleware.Auth(sessionStore, cfg.JWTSecret))
+		r.Use(docsLimiter.Limit)
+		r.Use(middleware.AuthWithAPIKeys(sessionStore, cfg.JWTSecret, apiKeyStore))
 
 		r.Post("/upload", uploadHandler.Upload)
 		r.Get("/{docID}/download", downloadHandler.Download)
 		r.Get("/search", searchHandler.Search)
 		r.Delete("/{docID}", deleteHandler.Delete)
 	})
+
+	// ── 5b. TTL sweeper ──────────────────────────────────────────
+	// Deletes expired document objects from storage, then their metadata
+	// rows (file-first so failures orphan a row, never a dangling pointer).
+	// One sweep at startup cleans crash leftovers; then hourly.
+	sweepOnce := func(ctx context.Context) {
+		keys, err := metaStore.ExpiredStorageKeys(ctx, time.Now())
+		if err != nil {
+			slog.Error("ttl sweep list failed", "error", err)
+			return
+		}
+		for _, key := range keys {
+			if err := connector.Delete(ctx, key); err != nil {
+				slog.Error("ttl sweep object delete failed", "key", key, "error", err)
+				continue
+			}
+		}
+		if n, err := metaStore.DeleteExpiredRows(ctx, time.Now()); err != nil {
+			slog.Error("ttl sweep row delete failed", "error", err)
+		} else if n > 0 {
+			slog.Info("ttl sweep removed expired documents", "count", n)
+		}
+	}
+	sweepCtx, stopSweeper := context.WithCancel(context.Background())
+	defer stopSweeper()
+	sweepOnce(sweepCtx)
+	go func() {
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				sweepOnce(sweepCtx)
+			case <-sweepCtx.Done():
+				return
+			}
+		}
+	}()
 
 	// ── 6. Start HTTP server ─────────────────────────────────────
 	addr := fmt.Sprintf(":%d", cfg.Port)
@@ -145,17 +225,28 @@ func main() {
 		WriteTimeout: cfg.WriteTimeout,
 	}
 
-	// Graceful shutdown on SIGINT/SIGTERM
+	// Graceful shutdown on SIGINT/SIGTERM.
+	//
+	// srv.Shutdown stops listeners immediately and waits for in-flight
+	// requests to finish (bounded by the timeout), unlike srv.Close which
+	// kills active connections mid-request — an upload truncated halfway
+	// through would otherwise leave an orphaned or partial ciphertext file.
 	go func() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		sig := <-sigCh
-		slog.Warn("received shutdown signal, shutting down server...", "signal", sig.String())
-		srv.Close()
+		slog.Warn("received shutdown signal, draining connections...", "signal", sig.String())
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			slog.Error("graceful shutdown timed out; forcing close", "error", err)
+			srv.Close()
+		}
 	}()
 
 	slog.Info("DocOps server starting", "addr", addr)
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		slog.Error("server error", "error", err)
 		os.Exit(1)
 	}

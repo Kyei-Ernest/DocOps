@@ -12,6 +12,26 @@ type Config struct {
 type RateLimitConfig struct {
 	Limit  int    `yaml:"limit"`
 	Window string `yaml:"window"`
+
+	// TrustProxyHeaders controls whether X-Forwarded-For / X-Real-IP are
+	// honored when deriving the client IP for rate limiting. Defaults to
+	// false: these headers are client-controlled and trivially spoofable,
+	// so enabling them on a directly-exposed server lets attackers rotate
+	// their identity per request and bypass the limit entirely (or poison
+	// a victim IP into 429s). Enable ONLY behind a proxy that sanitizes
+	// or overwrites these headers itself.
+	TrustProxyHeaders bool `yaml:"trust_proxy_headers"`
+
+	// Documents bounds the document routes (upload/download/search/delete).
+	// These endpoints serve machine traffic far more frequently than auth
+	// endpoints, so they carry their own, higher ceiling. Zero falls back
+	// to the auth limit during Parse.
+	Documents RateLimitSubConfig `yaml:"documents"`
+}
+
+type RateLimitSubConfig struct {
+	Limit  int    `yaml:"limit"`
+	Window string `yaml:"window"`
 }
 
 type ServerConfig struct {

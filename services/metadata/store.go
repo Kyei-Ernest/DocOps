@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 
 	"github.com/Kyei-Ernest/DocOps/models"
 	_ "github.com/mattn/go-sqlite3" // SQLite driver registered as a side effect
@@ -11,18 +12,36 @@ import (
 
 // Store wraps a SQLite database connection and exposes document CRUD + search operations.
 type Store struct {
-	db *sql.DB
+	db     *sql.DB
+	ownsDB bool // true when this Store opened its own connection (New); false for NewDB
 }
 
 // New opens (or creates) the SQLite database at dbPath, runs schema migrations,
 // and returns a ready-to-use Store. Returns an error if the DB cannot be opened
 // or the migration fails.
+//
+// Prefer NewDB when the application already holds a shared *sql.DB (as main.go
+// does): a single pool lets transactions span the users and documents tables,
+// which is what makes Master Key rotation atomic (ROADMAP P0-2).
 func New(dbPath string) (*Store, error) {
 	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open db: %w", err)
 	}
 
+	if err := migrate(db); err != nil {
+		return nil, fmt.Errorf("migration failed: %w", err)
+	}
+	return &Store{db: db, ownsDB: true}, nil
+}
+
+// NewDB constructs a Store on top of an existing, caller-owned *sql.DB and runs
+// schema migrations on it. The Store does NOT own the connection: Close is a
+// no-op and lifecycle remains the caller's responsibility.
+//
+// Sharing one pool across stores is what allows a single *sql.Tx to cover
+// both document and user-table writes — the mechanism behind atomic rotation.
+func NewDB(db *sql.DB) (*Store, error) {
 	if err := migrate(db); err != nil {
 		return nil, fmt.Errorf("migration failed: %w", err)
 	}
@@ -246,15 +265,61 @@ func (s *Store) Delete(ctx context.Context, id, userID string) error {
 
 // Close gracefully shuts down the underlying database connection.
 // Should be deferred immediately after a successful call to New.
+// When the Store was built over a caller-owned pool (NewDB), this is a no-op —
+// the caller owns the connection's lifecycle.
 func (s *Store) Close() error {
+	if !s.ownsDB {
+		return nil
+	}
 	return s.db.Close()
+}
+
+// InTx runs fn inside a single SQLite transaction on this store's connection
+// pool. Any error returned by fn rolls the transaction back completely; a nil
+// error commits. This is the primitive that makes multi-row mutations (e.g.
+// Master Key rotation spanning every wrapped DEK plus the user key row)
+// all-or-nothing instead of best-effort.
+//
+// Note: the default deferred BEGIN acquires its write lock at first write.
+// Under heavy concurrent writers SQLite may surface SQLITE_BUSY; v0.x accepts
+// this for a single-process deployment rather than forcing IMMEDIATE globally.
+func (s *Store) InTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	if err := fn(tx); err != nil {
+		if rbErr := tx.Rollback(); rbErr != nil {
+			// Commit/rollback already finalized (e.g. ctx cancelled mid-tx);
+			// surface both so operators see the full picture.
+			return fmt.Errorf("tx failed: %v (rollback also failed: %w)", err, rbErr)
+		}
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+	return nil
 }
 
 // ListAllForUser retrieves all documents belonging to a specific user,
 // including their key wrapping metadata (encrypted_dek, dek_nonce, file_nonce).
 // Used during Master Key rotation.
 func (s *Store) ListAllForUser(ctx context.Context, userID string) ([]*models.Document, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	return listAllForUser(ctx, s.db.QueryContext, userID)
+}
+
+// ListAllForUserTx is ListAllForUser executed on an explicit transaction.
+func (s *Store) ListAllForUserTx(ctx context.Context, tx *sql.Tx, userID string) ([]*models.Document, error) {
+	return listAllForUser(ctx, tx.QueryContext, userID)
+}
+
+// queryContext abstracts over *sql.DB and *sql.Tx so the scan logic below is
+// written exactly once for both the autocommit and transactional paths.
+type queryContextFn func(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+
+func listAllForUser(ctx context.Context, q queryContextFn, userID string) ([]*models.Document, error) {
+	rows, err := q(ctx, `
 		SELECT
 			id, user_id, name, file_type, provider, storage_key,
 			encrypted, size_bytes, tags, extracted_text,
@@ -291,7 +356,7 @@ func (s *Store) ListAllForUser(ctx context.Context, userID string) ([]*models.Do
 		}
 		results = append(results, doc)
 	}
-	return results, nil
+	return results, rows.Err()
 }
 
 // UpdateDEK updates the wrapped DEK and its nonce for a specific document.
@@ -303,6 +368,60 @@ func (s *Store) UpdateDEK(ctx context.Context, docID, userID string, encryptedDE
 		WHERE id = ? AND user_id = ?`, encryptedDEK, dekNonce, docID, userID)
 	if err != nil {
 		return fmt.Errorf("update DEK: %w", err)
+	}
+	return nil
+}
+
+// ExpiredStorageKeys lists storage keys whose documents have passed their
+// expires_at timestamp. Callers delete the underlying objects first, then call
+// DeleteExpiredRows — file-before-row ordering means a mid-sweep failure leaves
+// a recoverable orphaned row rather than a row pointing at nothing.
+func (s *Store) ExpiredStorageKeys(ctx context.Context, now time.Time) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT storage_key FROM documents WHERE expires_at IS NOT NULL AND expires_at < ?`, now)
+	if err != nil {
+		return nil, fmt.Errorf("expired storage keys: %w", err)
+	}
+	defer rows.Close()
+
+	var keys []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, fmt.Errorf("scan storage key: %w", err)
+		}
+		keys = append(keys, key)
+	}
+	return keys, rows.Err()
+}
+
+// DeleteExpiredRows removes every expired document row (and, via trigger, its
+// FTS entry). Returns the number of rows removed.
+func (s *Store) DeleteExpiredRows(ctx context.Context, now time.Time) (int64, error) {
+	result, err := s.db.ExecContext(ctx,
+		`DELETE FROM documents WHERE expires_at IS NOT NULL AND expires_at < ?`, now)
+	if err != nil {
+		return 0, fmt.Errorf("delete expired rows: %w", err)
+	}
+	n, _ := result.RowsAffected()
+	return n, nil
+}
+
+// UpdateDEKTx is UpdateDEK executed on an explicit transaction.
+func (s *Store) UpdateDEKTx(ctx context.Context, tx *sql.Tx, docID, userID string, encryptedDEK, dekNonce []byte) error {
+	result, err := tx.ExecContext(ctx, `
+		UPDATE documents
+		SET encrypted_dek = ?, dek_nonce = ?
+		WHERE id = ? AND user_id = ?`, encryptedDEK, dekNonce, docID, userID)
+	if err != nil {
+		return fmt.Errorf("update DEK: %w", err)
+	}
+	// Within rotation a zero-row update means the corpus shifted underneath
+	// us (deleted mid-rotation). Treat as an error so the caller rolls back
+	// rather than silently skipping a re-wrap.
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("update DEK: document %s not found for user", docID)
 	}
 	return nil
 }

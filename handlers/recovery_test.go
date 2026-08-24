@@ -99,7 +99,7 @@ func TestChangePassword_Success(t *testing.T) {
 
 	// Unwrap master key to simulate middleware context
 	kek := crypto.DeriveKEK("oldpassword123", dbUser.Salt, h.params)
-	masterKey, err := crypto.UnwrapDEK(dbUser.WrappedMasterKey, dbUser.MasterKeyNonce, kek)
+	masterKey, err := crypto.UnwrapDEKAny(dbUser.WrappedMasterKey, dbUser.MasterKeyNonce, kek, crypto.MasterKeyAAD(dbUser.ID))
 	if err != nil {
 		t.Fatalf("failed to unwrap master key: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestRotateMasterKey_Success(t *testing.T) {
 
 	dbUser, _ := h.users.GetByEmail(context.Background(), "alice@example.com")
 	kek := crypto.DeriveKEK("password123", dbUser.Salt, h.params)
-	oldMasterKey, _ := crypto.UnwrapDEK(dbUser.WrappedMasterKey, dbUser.MasterKeyNonce, kek)
+	oldMasterKey, _ := crypto.UnwrapDEKAny(dbUser.WrappedMasterKey, dbUser.MasterKeyNonce, kek, crypto.MasterKeyAAD(dbUser.ID))
 
 	// 2. Upload a document for Alice
 	docID := "doc_rotation_test"
@@ -200,7 +200,7 @@ func TestRotateMasterKey_Success(t *testing.T) {
 	// Fetch updated user to get the new wrapped master key
 	dbUserUpdated, _ := h.users.GetByEmail(context.Background(), "alice@example.com")
 	newKek := crypto.DeriveKEK("password123", dbUserUpdated.Salt, h.params)
-	newMasterKey, err := crypto.UnwrapDEK(dbUserUpdated.WrappedMasterKey, dbUserUpdated.MasterKeyNonce, newKek)
+	newMasterKey, err := crypto.UnwrapDEKAny(dbUserUpdated.WrappedMasterKey, dbUserUpdated.MasterKeyNonce, newKek, crypto.MasterKeyAAD(dbUserUpdated.ID))
 	if err != nil {
 		t.Fatalf("failed to decrypt new master key: %v", err)
 	}
@@ -212,7 +212,8 @@ func TestRotateMasterKey_Success(t *testing.T) {
 	}
 
 	// Unwrap document DEK using the NEW Master Key
-	unwrappedDEK, err := crypto.UnwrapDEK(updatedDoc.EncryptedDEK, updatedDoc.DEKNonce, newMasterKey)
+	unwrappedDEK, err := crypto.UnwrapDEKAny(updatedDoc.EncryptedDEK, updatedDoc.DEKNonce, newMasterKey,
+		crypto.DEKAAD(dbUser.ID, docID))
 	if err != nil {
 		t.Fatalf("failed to decrypt document DEK using new rotated master key: %v", err)
 	}
